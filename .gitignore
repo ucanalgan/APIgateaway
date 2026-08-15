@@ -1,0 +1,43 @@
+# Bağımlılıklar
+node_modules/
+
+# Derleme çıktıları
+dist/
+build/
+*.tsbuildinfo
+
+# Env Files
+.env
+.env.local
+.env.*.local
+
+# Log'lar
+*.log
+npm-debug.log*
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Editör
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# İşletim sistemi
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Geçici
+tmp/
+temp/
+
+# Planlama notları — yerelde kalsın
+PLAN.md
+
+# Claude Code / AI araç dosyaları
+.claude/
+CLAUDE.md
+.claude-*
+*.claude.md
