@@ -1,0 +1,18 @@
+{
+  "name": "@apigate/gateway",
+  "version": "0.1.0",
+  "description": "API Gateway application built on @apigate/core",
+  "type": "module",
+  "private": true,
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "tsc --build --clean",
+    "dev": "node --watch --experimental-strip-types src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@apigate/core": "*",
+    "fastify": "^5.12.0"
+  }
+}

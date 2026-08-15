@@ -1,0 +1,36 @@
+{
+  "name": "@apigate/core",
+  "version": "0.1.0",
+  "description": "Framework-agnostic rate limiting, auth, caching and circuit breaking primitives",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./ratelimit": {
+      "types": "./dist/ratelimit/index.d.ts",
+      "default": "./dist/ratelimit/index.js"
+    },
+    "./auth": {
+      "types": "./dist/auth/index.d.ts",
+      "default": "./dist/auth/index.js"
+    }
+  },
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "tsc --build --clean"
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "ioredis": "^6.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    }
+  }
+}
