@@ -5,9 +5,13 @@ server:
   maxHeaderCount: 100
   requestTimeoutMs: 30000
 
-redis:
-  url: redis://localhost:6379
-  failOpen: true
+# Redis-backed, distributed rate limiting is opt-in — uncomment when you're
+# actually running more than one gateway instance against the same quota
+# (e.g. via docker-compose's redis service). Without it, each route falls
+# back to an in-process memory store, which needs nothing else running.
+# redis:
+#   url: redis://localhost:6379
+#   failOpen: true
 
 routes:
   - id: echo-upstream
@@ -19,4 +23,9 @@ routes:
       targets:
         - http://localhost:4000
       timeoutMs: 5000
+    rateLimit:
+      algorithm: tokenBucket
+      keyBy: [ip]
+      limit: 10
+      windowSec: 60
 

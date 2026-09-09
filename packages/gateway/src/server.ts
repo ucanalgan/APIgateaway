@@ -6,11 +6,25 @@ import { matchRoute } from './routing/matcher.js';
 import { rewritePath } from './routing/rewrite.js';
 import { forwardRequest, UpstreamTimeoutError } from './proxy/forward.js';
 import { enforceHeaderLimit } from './security/limits.js';
+import { createRateLimitStores, enforceRateLimit } from './ratelimit/index.js';
 
 export function buildServer(config: GatewayConfig): FastifyInstance {
+  const trustProxyHops = config.server.trustProxyHops;
+  // "N hop güvenilir" demek: bizim doğrudan bağlandığımız taraf (hop 0) ve
+  // ondan sonraki N-1 ara proxy güvenilir kabul edilir; X-Forwarded-For'daki
+  // ilk güvenilmeyen adres gerçek client sayılır. Güvenlik varsayımı ağ
+  // seviyesinde: bu port'a sadece kendi reverse proxy'miz erişebiliyor
+  // olmalı — aksi halde saldırgan doğrudan bağlanıp N tane sahte hop
+  // uydurabilir (bkz. PLAN.md §5 "IP çıkarımı güvenlik açığı"). Fastify'ın
+  // trustProxy'ye sayı verilmesini artık desteklememesi (fail-closed) bu
+  // tam yüzden — biz aynı garantiyi ağ seviyesinde varsayıp kendi hop
+  // fonksiyonumuzu yazıyoruz.
+  const trustProxy: boolean | ((address: string, hop: number) => boolean) =
+    trustProxyHops > 0 ? (_address, hop) => hop < trustProxyHops : false;
+
   const app = Fastify({
     logger: true,
-    trustProxy: config.server.trustProxyHops > 0,
+    trustProxy,
     bodyLimit: config.server.maxBodyBytes,
     requestTimeout: config.server.requestTimeoutMs,
     requestIdHeader: 'x-request-id',
@@ -30,6 +44,11 @@ export function buildServer(config: GatewayConfig): FastifyInstance {
     return payload;
   });
 
+  const rateLimitStores = createRateLimitStores(config);
+  app.addHook('onClose', async () => {
+    await Promise.all([...rateLimitStores.values()].map((store) => store.close()));
+  });
+
   app.get('/health', async () => ({ status: 'ok' }));
 
   app.all('/*', async (request, reply) => {
@@ -42,6 +61,14 @@ export function buildServer(config: GatewayConfig): FastifyInstance {
         message: `No route matches ${request.method} ${path}.`,
         requestId: request.id,
       });
+    }
+
+    if (route.rateLimit) {
+      const store = rateLimitStores.get(route.id);
+      if (store) {
+        const proceed = await enforceRateLimit(store, route, request, reply);
+        if (!proceed) return reply;
+      }
     }
 
     const targetPath = rewritePath(request.url, route);

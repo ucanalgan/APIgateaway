@@ -149,19 +149,45 @@ routes:
 
 Every route needs an `id`, a `match.path` (an exact path, or a path ending in
 `/*` for a prefix match), and at least one `upstream.targets` entry.
-`rateLimit`, `cache`, `auth`, and `circuitBreaker` are being wired up in later
-phases — see [Status](#status) below.
+`cache`, `auth`, and `circuitBreaker` are being wired up in later phases — see
+[Status](#status) below.
+
+### Rate limiting
+
+A route with `rateLimit` gets one of five algorithms (`fixedWindow`,
+`tokenBucket`, `leakyBucket`, `slidingWindowLog`, `slidingWindowCounter`),
+keyed by client IP (`ip:<addr>:route:<id>`; tenant-based keys land with auth
+in a later phase). By default each route's counters live in an in-process
+memory store — enough for a single instance, and all `npm run dev` needs.
+
+Add a top-level `redis` block to share quota across multiple gateway
+instances instead (state moves into Redis, atomic via a Lua script per
+algorithm — see [packages/core/src/ratelimit](packages/core/src/ratelimit)):
+
+```yaml
+redis:
+  url: redis://localhost:6379
+  failOpen: true   # not enforced yet — see Status
+```
+
+`docker-compose.yml` already runs a `redis` service if you want to try this
+locally.
 
 ## Response contract
 
 ```
-X-Request-Id: <uuid>        # generated if the client didn't send one, always echoed back
+X-Request-Id: <uuid>          # generated if the client didn't send one, always echoed back
+RateLimit-Limit: 100          # on rate-limited routes only
+RateLimit-Remaining: 42
+RateLimit-Reset: 12
+Retry-After: 12                # 429 responses only
 ```
 
 Error responses share one shape:
 
 ```json
 { "error": "not_found", "message": "No route matches GET /nope.", "requestId": "..." }
+{ "error": "rate_limit_exceeded", "message": "...", "retryAfter": 12, "requestId": "..." }
 ```
 
 ## Testing
@@ -170,6 +196,17 @@ Error responses share one shape:
 npm run lint       # eslint
 npm run typecheck   # tsc --build, strict
 npm run test         # vitest
+```
+
+The Redis-backed store's tests are real integration tests (no mocking — see
+PLAN's testing philosophy) and need a reachable Redis; they skip themselves
+if `REDIS_URL` (defaults to `redis://localhost:6379`) isn't reachable, so
+`npm test` still works without Docker. Point `REDIS_URL` at a real instance
+to run them, e.g.:
+
+```bash
+docker run -d --rm -p 6379:6379 redis:7-alpine
+REDIS_URL=redis://localhost:6379 npm run test
 ```
 
 ## Benchmarking
@@ -192,8 +229,11 @@ of them come online.
 - [x] **Proxy** — route matching, undici forwarding, path rewrite, hop-by-hop
       header stripping, per-upstream timeouts, streaming request/response
       bodies, request ID propagation, header-count limits
-- [ ] **Rate limiting** — token bucket / sliding window / fixed window /
-      leaky bucket, atomic via Redis Lua scripts
+- [x] **Rate limiting** — all five algorithms, in-process memory store or
+      distributed Redis store (atomic via Lua, proven against a real Redis —
+      see `packages/core/test/ratelimit`), standard headers + 429 contract.
+      IP-keyed only for now; tenant keys and the Redis-down `failOpen`
+      behavior land with auth and resilience below.
 - [ ] **Auth** — API key and JWT verification, tenant-based quotas
 - [ ] **Resilience** — circuit breaker, load balancing, retries
 - [ ] **Cache** — Cache-Control-aware response caching

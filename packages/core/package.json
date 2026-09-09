@@ -21,10 +21,13 @@
   },
   "files": ["dist", "src"],
   "scripts": {
-    "build": "tsc --build",
+    "build": "tsc --build && node scripts/copy-lua.mjs",
     "clean": "tsc --build --clean"
   },
   "dependencies": {},
+  "devDependencies": {
+    "ioredis": "^6.0.0"
+  },
   "peerDependencies": {
     "ioredis": "^6.0.0"
   },
