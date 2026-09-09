@@ -9,4 +9,14 @@ redis:
   url: redis://localhost:6379
   failOpen: true
 
-routes: []
+routes:
+  - id: echo-upstream
+    match:
+      path: /echo/*
+    rewrite:
+      stripPrefix: /echo
+    upstream:
+      targets:
+        - http://localhost:4000
+      timeoutMs: 5000
+
