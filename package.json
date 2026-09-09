@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc --build",
     "clean": "tsc --build --clean",
-    "typecheck": "tsc --build --dry",
+    "typecheck": "tsc --build --force",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint .",
@@ -24,6 +24,7 @@
   "devDependencies": {
     "@types/node": "^26.2.0",
     "typescript": "~5.9.3",
+    "tsx": "^4.23.13",
     "vitest": "^4.1.10",
     "eslint": "^9.39.5",
     "typescript-eslint": "^8.67.0",

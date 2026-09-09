@@ -1,0 +1,11 @@
+{
+  "name": "upstream-fixture",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Sahte upstream servis — gateway'i proxy/load-balance/health-check senaryolarında test etmek için",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules
+**/dist
+**/*.tsbuildinfo
+.git
+.github
+bench
+examples
+PLAN.md
+PROMPT.md
+ask.ps1

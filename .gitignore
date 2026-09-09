@@ -33,8 +33,11 @@ Desktop.ini
 tmp/
 temp/
 
-# Planlama notları — yerelde kalsın
 PLAN.md
+PROMPT.md
+ask.ps1
+.ollama-logs/
+*.bak
 
 # Claude Code / AI araç dosyaları
 .claude/

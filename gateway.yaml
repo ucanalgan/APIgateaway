@@ -1,0 +1,12 @@
+server:
+  port: 8080
+  trustProxyHops: 1
+  maxBodyBytes: 1048576
+  maxHeaderCount: 100
+  requestTimeoutMs: 30000
+
+redis:
+  url: redis://localhost:6379
+  failOpen: true
+
+routes: []
