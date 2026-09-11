@@ -21,6 +21,10 @@
     "./breaker": {
       "types": "./dist/breaker/index.d.ts",
       "default": "./dist/breaker/index.js"
+    },
+    "./cache": {
+      "types": "./dist/cache/index.d.ts",
+      "default": "./dist/cache/index.js"
     }
   },
   "files": ["dist", "src"],

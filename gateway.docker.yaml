@@ -64,3 +64,23 @@ routes:
       keyBy: [tenant]
       limit: 100
       windowSec: 60
+
+  # Second GET to the same path comes back with X-Cache: HIT and never
+  # touches upstream (see README § Cache). setHeaders/removeHeaders run on
+  # the outbound request either way, cached or not.
+  - id: cached-echo
+    match:
+      path: /cached/*
+    rewrite:
+      stripPrefix: /cached
+    upstream:
+      targets:
+        - http://upstream:4000
+      timeoutMs: 5000
+    cache:
+      enabled: true
+      ttlSec: 30
+      varyBy: [Accept-Language]
+    transform:
+      request:
+        setHeaders: { X-Gateway: apigate }

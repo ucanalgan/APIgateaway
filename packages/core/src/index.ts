@@ -14,3 +14,11 @@ export {
   type JwtVerifyOptions,
 } from './auth/index.js';
 export { CircuitBreaker, type CircuitBreakerOptions, type CircuitState } from './breaker/circuitBreaker.js';
+export {
+  decideCacheability,
+  createMemoryCacheStore,
+  createRedisCacheStore,
+  type CacheDecision,
+  type CachedResponse,
+  type CacheStore,
+} from './cache/index.js';

@@ -2,15 +2,19 @@ import { randomUUID } from 'node:crypto';
 import type { Readable } from 'node:stream';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { Redis } from 'ioredis';
+import { decideCacheability } from '@apigate/core/cache';
 import type { GatewayConfig } from './config/schema.js';
 import { matchRoute } from './routing/matcher.js';
 import { rewritePath } from './routing/rewrite.js';
 import { UpstreamTimeoutError } from './proxy/forward.js';
 import { createBalancer } from './proxy/balancer.js';
 import { forwardWithRetry, NoHealthyTargetError } from './proxy/retry.js';
+import { applyRequestTransform } from './proxy/transform.js';
+import { bufferStream } from './proxy/bufferStream.js';
 import { enforceHeaderLimit } from './security/limits.js';
 import { createRateLimitStores, enforceRateLimit } from './ratelimit/index.js';
 import { authenticateRequest } from './auth/index.js';
+import { createCacheStores, buildCacheKey, stripUncacheableHeaders } from './cache/index.js';
 import { createDbPool, runMigrations } from './db/client.js';
 import { createUsageBuffer } from './usage/buffer.js';
 
@@ -30,7 +34,9 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
     );
   }
 
-  const needsRedis = config.redis && (config.routes.some((route) => route.rateLimit) || apiKeyRoutes.length > 0);
+  const needsRedis =
+    config.redis &&
+    (config.routes.some((route) => route.rateLimit || route.cache?.enabled) || apiKeyRoutes.length > 0);
   // `failOpen`/the auth cache fallback need commands to fail *fast* when
   // Redis is unreachable. ioredis's default is the opposite — it queues
   // commands indefinitely while reconnecting, so a down Redis would hang
@@ -102,11 +108,13 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
   }
 
   const rateLimitStores = createRateLimitStores(config, redisClient);
+  const cacheStores = createCacheStores(config, redisClient);
   const balancers = new Map(config.routes.map((route) => [route.id, createBalancer(route)]));
   const failOpen = config.redis?.failOpen ?? true;
 
   app.addHook('onClose', async () => {
     await Promise.all([...rateLimitStores.values()].map((store) => store.close()));
+    await Promise.all([...cacheStores.values()].map((store) => store.close()));
     for (const balancer of balancers.values()) balancer.close();
     await usageBuffer?.close();
     await dbPool?.end();
@@ -156,6 +164,24 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
       }
     }
 
+    const cacheStore = route.cache?.enabled ? cacheStores.get(route.id) : undefined;
+    const cacheKey =
+      cacheStore && request.method === 'GET'
+        ? buildCacheKey(route, request.method, path, request.headers, authOutcome.tenantId)
+        : undefined;
+
+    if (cacheStore && cacheKey) {
+      const cached = await cacheStore.get(cacheKey);
+      if (cached) {
+        reply.header('X-Cache', 'HIT');
+        reply.code(cached.statusCode);
+        for (const [key, value] of Object.entries(cached.headers)) {
+          reply.header(key, value);
+        }
+        return reply.send(cached.body);
+      }
+    }
+
     const targetPath = rewritePath(request.url, route);
     const balancer = balancers.get(route.id)!;
     const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
@@ -163,7 +189,7 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
     try {
       const upstream = await forwardWithRetry(route, balancer, targetPath, {
         method: request.method,
-        headers: request.headers,
+        headers: applyRequestTransform(route, request.headers),
         body: hasBody ? (request.body as Readable) : undefined,
         timeoutMs: route.upstream.timeoutMs,
         clientIp: request.ip,
@@ -174,6 +200,29 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
       for (const [key, value] of Object.entries(upstream.headers)) {
         reply.header(key, value);
       }
+
+      if (cacheStore && cacheKey) {
+        // Cache'lemek için tam gövdeyi okumamız gerekiyor — bu route'a özel,
+        // bilinçli bir buffering istisnası (bkz. README § Resilience'daki
+        // retry buffer'lama ile aynı gerekçe).
+        reply.header('X-Cache', 'MISS');
+        const body = await bufferStream(upstream.body);
+        const decision = decideCacheability(upstream.statusCode, upstream.headers, route.cache!.ttlSec);
+
+        if (decision.cacheable && body.byteLength <= config.server.maxBodyBytes) {
+          const cached = {
+            statusCode: upstream.statusCode,
+            headers: stripUncacheableHeaders(upstream.headers),
+            body,
+          };
+          cacheStore.set(cacheKey, cached, decision.ttlSec).catch((err: unknown) => {
+            request.log.warn({ err, route: route.id }, 'failed to write cache entry');
+          });
+        }
+
+        return reply.send(body);
+      }
+
       return reply.send(upstream.body);
     } catch (err) {
       if (err instanceof UpstreamTimeoutError) {

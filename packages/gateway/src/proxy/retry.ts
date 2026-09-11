@@ -1,6 +1,7 @@
 import type { Readable } from 'node:stream';
 import { forwardRequest, type ForwardOptions, type ForwardResult } from './forward.js';
 import type { Balancer } from './balancer.js';
+import { bufferStream } from './bufferStream.js';
 import type { RouteConfig } from '../config/schema.js';
 
 const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE']);
@@ -36,7 +37,7 @@ export async function forwardWithRetry(
 
   // Stream'ler tek seferlik — retry mümkünse body'yi bir kez buffer'la ki
   // her denemede yeniden gönderilebilsin.
-  const body = eligible && opts.body ? await bufferBody(opts.body) : opts.body;
+  const body = eligible && opts.body ? await bufferStream(opts.body) : opts.body;
 
   let lastError: unknown;
 
@@ -79,12 +80,4 @@ function jitteredBackoff(backoffMs: number, attempt: number): number {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function bufferBody(stream: Readable): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as ArrayBufferLike));
-  }
-  return Buffer.concat(chunks);
 }

@@ -56,3 +56,14 @@ routes:
   #   retry: { attempts: 2, backoffMs: 100 }
   #   circuitBreaker: { failureThreshold: 3, resetTimeoutMs: 10000 }
 
+  # Second GET to the same path comes back with X-Cache: HIT and never
+  # touches upstream (see README § Cache). The example fixture doesn't set
+  # its own Cache-Control, so this uses ttlSec as-is.
+  # - id: cached-echo
+  #   match: { path: /cached/* }
+  #   rewrite: { stripPrefix: /cached }
+  #   upstream: { targets: [http://localhost:4000] }
+  #   cache: { enabled: true, ttlSec: 30, varyBy: [Accept-Language] }
+  #   transform:
+  #     request: { setHeaders: { X-Gateway: apigate } }
+

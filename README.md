@@ -56,7 +56,7 @@ apigate/
 │  │     ├─ ratelimit/       # algorithms, Store interface, Redis/memory stores
 │  │     ├─ auth/            # API key + JWT verification primitives
 │  │     ├─ breaker/         # circuit breaker
-│  │     └─ cache/           # Cache-Control interpretation
+│  │     └─ cache/           # Cache-Control interpretation, Redis/memory stores
 │  │
 │  ├─ adapters/               # core → framework glue (fastify, express)
 │  │
@@ -68,6 +68,7 @@ apigate/
 │     │  ├─ security/         # request limits
 │     │  ├─ auth/             # Postgres/Redis-backed key + JWT verification
 │     │  ├─ ratelimit/        # wires core's Store into requests, tenant/IP keys
+│     │  ├─ cache/            # cache key building, tenant isolation
 │     │  ├─ usage/            # buffered usage_records writer
 │     │  ├─ db/                # Postgres client, migrations, repositories
 │     │  ├─ admin/            # tenant/key management API (planned)
@@ -120,11 +121,12 @@ docker compose up --build
 ```
 
 This starts the gateway, Redis, PostgreSQL, and **two** example-upstream
-instances together, using [gateway.docker.yaml](gateway.docker.yaml)
-(redis/db wired up, an `auth: apiKey` route, and a two-target route with
-health checks/retry/a circuit breaker) rather than the dependency-free root
-`gateway.yaml`. Try `docker compose stop upstream2` and keep curling
-`/echo/*` — see [§ Resilience](#resilience).
+instances together, using [gateway.docker.yaml](gateway.docker.yaml) —
+redis/db wired up, and routes demonstrating auth (`/api/*`), resilience
+(`/echo/*`, two targets + health check + breaker), and caching (`/cached/*`)
+— rather than the dependency-free root `gateway.yaml`. Try
+`docker compose stop upstream2` and keep curling `/echo/*` — see
+[§ Resilience](#resilience).
 
 ## Configuration
 
@@ -160,7 +162,6 @@ routes:
 
 Every route needs an `id`, a `match.path` (an exact path, or a path ending in
 `/*` for a prefix match), and at least one `upstream.targets` entry.
-`cache` is being wired up in a later phase — see [Status](#status) below.
 
 ### Rate limiting
 
@@ -236,6 +237,50 @@ flushed to Postgres `usage_records` in batches (every 5s or 500 records,
 whichever first) rather than written synchronously per request — see
 [packages/gateway/src/usage/buffer.ts](packages/gateway/src/usage/buffer.ts).
 
+### Cache
+
+A route with `cache.enabled` caches **GET** responses. The upstream's own
+`Cache-Control` is honored on top of the route's `ttlSec`: `no-store`,
+`no-cache`, and `private` are never cached (a shared cache — which this is —
+must not store `private` responses); an upstream `max-age` is used instead
+of `ttlSec` when it's *shorter*, never longer — `ttlSec` is a ceiling the
+operator sets, not a suggestion. Only `200` responses are cached. A hit
+short-circuits the whole rest of the pipeline (no transform, no proxy call)
+and answers with `X-Cache: HIT`; a miss still gets `X-Cache: MISS` and is
+stored for next time if cacheable.
+
+```yaml
+cache:
+  enabled: true
+  ttlSec: 60
+  varyBy: [Accept, Accept-Language]   # separate cache entries per header value
+```
+
+**The cache key is scoped by tenant whenever the route has `auth` enabled**,
+on top of whatever `varyBy` lists — this isn't configurable, and it's not
+about response formatting: `varyBy` is for content-negotiation headers, not
+authorization boundaries, and without this a cached response meant for one
+tenant would get served to another. `Set-Cookie` is stripped before a
+response is cached or replayed, for the same reason (a shared cache handing
+out one user's session cookie to the next is a classic caching bug).
+
+Caching a response means reading its body into memory once to store it —
+the same buffering trade-off `retry` makes for request bodies, here applied
+to the response instead, and scoped to routes that opt into `cache`.
+Responses larger than `server.maxBodyBytes` are served normally but skipped
+by the cache.
+
+**`transform.request`** (`setHeaders`/`removeHeaders`) runs on the outbound
+request to upstream — so on a cache miss, never on a hit, since a hit skips
+the proxy call (and hence the outbound request) entirely:
+
+```yaml
+transform:
+  request:
+    setHeaders: { X-Gateway: apigate }
+    removeHeaders: [X-Internal-Token]
+```
+
 ### Resilience
 
 With more than one `upstream.targets` entry, requests are spread round-robin
@@ -281,6 +326,7 @@ RateLimit-Limit: 100          # on rate-limited routes only
 RateLimit-Remaining: 42
 RateLimit-Reset: 12
 Retry-After: 12                # 429 responses only
+X-Cache: HIT | MISS            # on cache-enabled routes only
 ```
 
 Error responses share one shape:
@@ -347,7 +393,13 @@ of them come online.
       see `packages/core/test/breaker`); retry with backoff+jitter for
       idempotent methods on connection failure only; the Redis-down
       `failOpen` policy, enforced. See `packages/gateway/test/balancer.test.ts`.
-- [ ] **Cache** — Cache-Control-aware response caching
+- [x] **Cache** — GET-only response cache honoring upstream `Cache-Control`
+      (`no-store`/`no-cache`/`private` never cached, `max-age` capped by the
+      route's `ttlSec`), Redis or in-process memory backing, tenant-scoped
+      keys on authenticated routes, `Set-Cookie` stripped from what's stored,
+      `X-Cache: HIT`/`MISS`; request-side header transform
+      (`setHeaders`/`removeHeaders`). See `packages/core/test/cache` and
+      `packages/gateway/test/cache.test.ts`.
 - [ ] **Admin API + observability** — tenant/key management, Prometheus
       metrics
 - [ ] **Express adapter + standalone examples** — proof that `core` really is
