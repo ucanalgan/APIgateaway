@@ -77,7 +77,9 @@ export async function authenticateRequest(
     return { ok: false };
   }
 
-  const record = await lookupApiKey(token, deps.db, deps.redis);
+  const record = await lookupApiKey(token, deps.db, deps.redis, (err) =>
+    request.log.warn({ err }, 'api key cache unavailable, falling back to db'),
+  );
   if (!record || !verifyApiKeyHash(token, record.keyHash)) {
     await sendUnauthorized(reply, request, 'Invalid, expired, or revoked API key.');
     return { ok: false };
@@ -94,20 +96,36 @@ interface CachedApiKeyRecord {
   readonly plan: TenantPlan;
 }
 
-async function lookupApiKey(raw: string, db: DbPool, redis: Redis | undefined): Promise<CachedApiKeyRecord | null> {
+async function lookupApiKey(
+  raw: string,
+  db: DbPool,
+  redis: Redis | undefined,
+  onCacheError: (err: unknown) => void,
+): Promise<CachedApiKeyRecord | null> {
   const hash = hashApiKey(raw);
   const cacheKey = apiKeyCacheKey(hash);
 
+  // Cache sadece bir optimizasyon — Redis'e ulaşılamıyorsa DB'ye düş, isteği
+  // hiç kırma (auth için "fail open" diye bir şey yok, ama cache down olması
+  // auth'u da düşürmemeli).
   if (redis) {
-    const cached = await redis.get(cacheKey);
-    if (cached === NEGATIVE_CACHE_MARKER) return null;
-    if (cached) return JSON.parse(cached) as CachedApiKeyRecord;
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached === NEGATIVE_CACHE_MARKER) return null;
+      if (cached) return JSON.parse(cached) as CachedApiKeyRecord;
+    } catch (err) {
+      onCacheError(err);
+    }
   }
 
   const record = await findActiveApiKeyWithPlan(db, hash);
 
   if (redis) {
-    await redis.set(cacheKey, record ? JSON.stringify(record) : NEGATIVE_CACHE_MARKER, 'EX', API_KEY_CACHE_TTL_SEC);
+    try {
+      await redis.set(cacheKey, record ? JSON.stringify(record) : NEGATIVE_CACHE_MARKER, 'EX', API_KEY_CACHE_TTL_SEC);
+    } catch (err) {
+      onCacheError(err);
+    }
   }
 
   // Hot path'i bloklamasın — cevap zaten döndü sayılır.

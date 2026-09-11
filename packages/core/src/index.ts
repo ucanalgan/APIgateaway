@@ -13,3 +13,4 @@ export {
   type GeneratedApiKey,
   type JwtVerifyOptions,
 } from './auth/index.js';
+export { CircuitBreaker, type CircuitBreakerOptions, type CircuitState } from './breaker/circuitBreaker.js';

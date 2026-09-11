@@ -15,12 +15,22 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
+  # Two instances so the resilience demo has something to fail over between —
+  # see gateway.docker.yaml's `echo-upstream` route (healthCheck + retry +
+  # circuitBreaker). Try: `docker compose stop upstream2`, keep curling.
   upstream:
     build: ./examples/upstream
     environment:
       PORT: 4000
     ports:
       - "4000:4000"
+
+  upstream2:
+    build: ./examples/upstream
+    environment:
+      PORT: 4000
+    ports:
+      - "4001:4000"
 
   gateway:
     build: .
@@ -32,6 +42,7 @@ services:
       - redis
       - postgres
       - upstream
+      - upstream2
 
 volumes:
   postgres-data:

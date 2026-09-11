@@ -64,7 +64,7 @@ apigate/
 │     ├─ src/
 │     │  ├─ config/           # gateway.yaml loading + Zod validation
 │     │  ├─ routing/          # route matcher + path rewrite
-│     │  ├─ proxy/            # undici-based forwarding
+│     │  ├─ proxy/            # undici forwarding, load balancer, retry
 │     │  ├─ security/         # request limits
 │     │  ├─ auth/             # Postgres/Redis-backed key + JWT verification
 │     │  ├─ ratelimit/        # wires core's Store into requests, tenant/IP keys
@@ -119,9 +119,12 @@ curl http://localhost:8080/echo/hello   # proxied to the example upstream
 docker compose up --build
 ```
 
-This starts the gateway, Redis, PostgreSQL, and the example upstream together,
-using [gateway.docker.yaml](gateway.docker.yaml) (redis/db wired up, plus an
-`auth: apiKey` route) rather than the dependency-free root `gateway.yaml`.
+This starts the gateway, Redis, PostgreSQL, and **two** example-upstream
+instances together, using [gateway.docker.yaml](gateway.docker.yaml)
+(redis/db wired up, an `auth: apiKey` route, and a two-target route with
+health checks/retry/a circuit breaker) rather than the dependency-free root
+`gateway.yaml`. Try `docker compose stop upstream2` and keep curling
+`/echo/*` — see [§ Resilience](#resilience).
 
 ## Configuration
 
@@ -157,8 +160,7 @@ routes:
 
 Every route needs an `id`, a `match.path` (an exact path, or a path ending in
 `/*` for a prefix match), and at least one `upstream.targets` entry.
-`cache` and `circuitBreaker` are being wired up in later phases — see
-[Status](#status) below.
+`cache` is being wired up in a later phase — see [Status](#status) below.
 
 ### Rate limiting
 
@@ -177,7 +179,7 @@ algorithm — see [packages/core/src/ratelimit](packages/core/src/ratelimit)):
 ```yaml
 redis:
   url: redis://localhost:6379
-  failOpen: true   # not enforced yet — see Status
+  failOpen: true   # if Redis errors: true = let requests through, false = 503 (see § Resilience)
 ```
 
 `docker-compose.yml` already runs a `redis` service if you want to try this
@@ -233,6 +235,43 @@ Full usage per tenant (status code, latency, route) is buffered in memory and
 flushed to Postgres `usage_records` in batches (every 5s or 500 records,
 whichever first) rather than written synchronously per request — see
 [packages/gateway/src/usage/buffer.ts](packages/gateway/src/usage/buffer.ts).
+
+### Resilience
+
+With more than one `upstream.targets` entry, requests are spread round-robin
+across them. Add `healthCheck` and each target gets proactively probed and
+pulled out of rotation on failure (and back in once it recovers); add
+`circuitBreaker` and each target additionally gets its own breaker
+(closed → open after `failureThreshold` consecutive failures → half-open
+retrial after `resetTimeoutMs`) that reacts to real request failures —
+useful for catching problems between health-check intervals, or when there's
+no `healthCheck` at all. Neither needs the other; either needs nothing beyond
+listing more than one target to start round-robin-ing.
+
+```yaml
+upstream:
+  targets: [http://svc-1:3000, http://svc-2:3000]
+  healthCheck: { path: /health, intervalMs: 10000 }   # optional
+circuitBreaker: { failureThreshold: 5, resetTimeoutMs: 30000 }   # optional, per route
+retry: { attempts: 2, backoffMs: 100 }                            # optional, per route
+```
+
+`retry` only fires for **GET/HEAD/PUT/DELETE** and only on a connection
+failure or timeout — never because the upstream responded with a 5xx
+(retrying that risks amplifying load on something already struggling; a 5xx
+is passed straight through instead, though it still counts as a failure
+against that target's breaker). Each attempt re-consults the balancer, so a
+retry naturally lands on a different target once the first one's breaker
+trips or health check marks it down. A body on a retryable request is buffered first, since a stream can only be
+sent once — the gateway otherwise proxies bodies as a true, unbuffered
+stream, so this trade-off is scoped to routes that opt into `retry`.
+
+**`redis.failOpen`** (from [§ Rate limiting](#rate-limiting)) is enforced:
+if the rate-limit store errors (Redis unreachable), the default `true`
+lets the request through logging a warning; `false` returns `503`. The
+API-key auth cache degrades the same way regardless of `failOpen` — a
+down Redis just means every request falls back to Postgres instead of
+failing outright, since the cache was only ever an optimization.
 
 ## Response contract
 
@@ -297,15 +336,17 @@ of them come online.
 - [x] **Rate limiting** — all five algorithms, in-process memory store or
       distributed Redis store (atomic via Lua, proven against a real Redis —
       see `packages/core/test/ratelimit`), standard headers + 429 contract,
-      IP- and/or tenant-keyed. The Redis-down `failOpen` behavior isn't
-      enforced yet — see Resilience below.
+      IP- and/or tenant-keyed, Redis-down `failOpen`/fail-closed.
 - [x] **Auth** — API key (Postgres-backed, sha256 + constant-time compare,
-      Redis verification cache with instant revoke invalidation) and JWT
-      (JWKS) verification; tenant-scoped, plan-driven rate limits; buffered
-      usage recording. See `packages/gateway/test/db.test.ts` and
-      `packages/core/test/auth`.
-- [ ] **Resilience** — circuit breaker, load balancing, retries, the
-      Redis-down `failOpen` policy
+      Redis verification cache with instant revoke invalidation, degrades to
+      Postgres if the cache is down) and JWT (JWKS) verification;
+      tenant-scoped, plan-driven rate limits; buffered usage recording. See
+      `packages/gateway/test/db.test.ts` and `packages/core/test/auth`.
+- [x] **Resilience** — round-robin load balancing with optional active
+      health checks; a per-target circuit breaker (closed/open/half-open,
+      see `packages/core/test/breaker`); retry with backoff+jitter for
+      idempotent methods on connection failure only; the Redis-down
+      `failOpen` policy, enforced. See `packages/gateway/test/balancer.test.ts`.
 - [ ] **Cache** — Cache-Control-aware response caching
 - [ ] **Admin API + observability** — tenant/key management, Prometheus
       metrics

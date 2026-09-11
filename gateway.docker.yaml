@@ -16,6 +16,9 @@ db:
   url: postgres://apigate:apigate@postgres:5432/apigate
 
 routes:
+  # Two targets + health check + breaker + retry — stop one
+  # (`docker compose stop upstream2`) and traffic keeps flowing through the
+  # other with no failed requests. See README § Resilience.
   - id: echo-upstream
     match:
       path: /echo/*
@@ -24,7 +27,17 @@ routes:
     upstream:
       targets:
         - http://upstream:4000
+        - http://upstream2:4000
       timeoutMs: 5000
+      healthCheck:
+        path: /health
+        intervalMs: 5000
+    retry:
+      attempts: 2
+      backoffMs: 100
+    circuitBreaker:
+      failureThreshold: 3
+      resetTimeoutMs: 10000
     rateLimit:
       algorithm: tokenBucket
       keyBy: [ip]

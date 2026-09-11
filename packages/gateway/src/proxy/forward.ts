@@ -18,7 +18,11 @@ export class UpstreamTimeoutError extends Error {}
 export interface ForwardOptions {
   readonly method: string;
   readonly headers: IncomingHttpHeaders;
-  readonly body: Readable | undefined;
+  /**
+   * A `Buffer` (not a `Readable`) when the caller might retry this request —
+   * streams can only be consumed once, so retry.ts buffers the body first.
+   */
+  readonly body: Readable | Buffer | undefined;
   readonly timeoutMs: number;
   readonly clientIp: string;
   readonly requestId: string;

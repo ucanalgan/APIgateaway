@@ -37,6 +37,10 @@ export interface RateLimitContext {
  * PLAN.md §5: "Üçü aynı anda uygulanabilir; herhangi biri reddederse istek
  * reddedilir"). Standart header'ları yazar; aşılmışsa 429 gönderir.
  * `false` dönerse handler zaten yanıt verdi demektir.
+ *
+ * Store'un kendisi hata verirse (örn. Redis'e ulaşılamıyor), `failOpen`
+ * kararı devreye girer — bkz. PLAN.md §9 "rate limiter'ın kendisi outage
+ * sebebi olmamalı".
  */
 export async function enforceRateLimit(
   store: Store,
@@ -44,6 +48,7 @@ export async function enforceRateLimit(
   request: FastifyRequest,
   reply: FastifyReply,
   context: RateLimitContext = {},
+  failOpen = true,
 ): Promise<boolean> {
   const config = route.rateLimit;
   if (!config) return true;
@@ -75,7 +80,22 @@ export async function enforceRateLimit(
 
   if (checks.length === 0) return true;
 
-  const results = await Promise.all(checks.map((check) => store.consume(check.key, check.policy)));
+  let results: RateLimitResult[];
+  try {
+    results = await Promise.all(checks.map((check) => store.consume(check.key, check.policy)));
+  } catch (err) {
+    request.log.error({ err, route: route.id, failOpen }, 'rate limit store unavailable');
+
+    if (failOpen) return true;
+
+    await reply.code(503).send({
+      error: 'rate_limit_unavailable',
+      message: 'Rate limiting is temporarily unavailable.',
+      requestId: request.id,
+    });
+    return false;
+  }
+
   const rejected = results.find((r) => !r.allowed);
   const reported: RateLimitResult = rejected ?? results[0]!;
 

@@ -44,3 +44,15 @@ routes:
   #   auth: { type: apiKey }
   #   rateLimit: { algorithm: tokenBucket, keyBy: [tenant], limit: 100, windowSec: 60 }
 
+  # Run a second upstream fixture (`PORT=4001 node examples/upstream/index.js`)
+  # and try this to see failover — stop either one, traffic keeps flowing
+  # through the other with no failed requests (see README § Resilience).
+  # - id: resilient-api
+  #   match: { path: /r/* }
+  #   rewrite: { stripPrefix: /r }
+  #   upstream:
+  #     targets: [http://localhost:4000, http://localhost:4001]
+  #     healthCheck: { path: /health, intervalMs: 5000 }
+  #   retry: { attempts: 2, backoffMs: 100 }
+  #   circuitBreaker: { failureThreshold: 3, resetTimeoutMs: 10000 }
+

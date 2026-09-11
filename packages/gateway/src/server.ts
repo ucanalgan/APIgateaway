@@ -5,7 +5,9 @@ import { Redis } from 'ioredis';
 import type { GatewayConfig } from './config/schema.js';
 import { matchRoute } from './routing/matcher.js';
 import { rewritePath } from './routing/rewrite.js';
-import { forwardRequest, UpstreamTimeoutError } from './proxy/forward.js';
+import { UpstreamTimeoutError } from './proxy/forward.js';
+import { createBalancer } from './proxy/balancer.js';
+import { forwardWithRetry, NoHealthyTargetError } from './proxy/retry.js';
 import { enforceHeaderLimit } from './security/limits.js';
 import { createRateLimitStores, enforceRateLimit } from './ratelimit/index.js';
 import { authenticateRequest } from './auth/index.js';
@@ -29,7 +31,13 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
   }
 
   const needsRedis = config.redis && (config.routes.some((route) => route.rateLimit) || apiKeyRoutes.length > 0);
-  const redisClient = needsRedis ? new Redis(config.redis!.url) : undefined;
+  // `failOpen`/the auth cache fallback need commands to fail *fast* when
+  // Redis is unreachable. ioredis's default is the opposite — it queues
+  // commands indefinitely while reconnecting, so a down Redis would hang
+  // every request instead of tripping either fallback.
+  const redisClient = needsRedis
+    ? new Redis(config.redis!.url, { enableOfflineQueue: false, maxRetriesPerRequest: 1, connectTimeout: 2000 })
+    : undefined;
 
   const dbPool = config.db && apiKeyRoutes.length > 0 ? createDbPool(config.db.url) : undefined;
   if (dbPool) await runMigrations(dbPool);
@@ -56,6 +64,13 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
     requestTimeout: config.server.requestTimeoutMs,
     requestIdHeader: 'x-request-id',
     genReqId: () => randomUUID(),
+  });
+
+  // ioredis emits 'error' on every failed reconnect attempt; without a
+  // listener Node logs "Unhandled error event" straight to stderr, bypassing
+  // Fastify's structured logger entirely.
+  redisClient?.on('error', (err: unknown) => {
+    app.log.warn({ err }, 'redis connection error');
   });
 
   app.decorateRequest('apigateTenantId', undefined);
@@ -87,8 +102,12 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
   }
 
   const rateLimitStores = createRateLimitStores(config, redisClient);
+  const balancers = new Map(config.routes.map((route) => [route.id, createBalancer(route)]));
+  const failOpen = config.redis?.failOpen ?? true;
+
   app.addHook('onClose', async () => {
     await Promise.all([...rateLimitStores.values()].map((store) => store.close()));
+    for (const balancer of balancers.values()) balancer.close();
     await usageBuffer?.close();
     await dbPool?.end();
     if (redisClient) await redisClient.quit();
@@ -122,29 +141,27 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
     if (route.rateLimit) {
       const store = rateLimitStores.get(route.id);
       if (store) {
-        const proceed = await enforceRateLimit(store, route, request, reply, {
-          ...(authOutcome.tenantId !== undefined ? { tenantId: authOutcome.tenantId } : {}),
-          ...(authOutcome.plan !== undefined ? { tenantPlan: authOutcome.plan } : {}),
-        });
+        const proceed = await enforceRateLimit(
+          store,
+          route,
+          request,
+          reply,
+          {
+            ...(authOutcome.tenantId !== undefined ? { tenantId: authOutcome.tenantId } : {}),
+            ...(authOutcome.plan !== undefined ? { tenantPlan: authOutcome.plan } : {}),
+          },
+          failOpen,
+        );
         if (!proceed) return reply;
       }
     }
 
     const targetPath = rewritePath(request.url, route);
-    const target = route.upstream.targets[0];
-
-    if (!target) {
-      return reply.code(502).send({
-        error: 'bad_gateway',
-        message: `Route "${route.id}" has no upstream targets configured.`,
-        requestId: request.id,
-      });
-    }
-
+    const balancer = balancers.get(route.id)!;
     const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
 
     try {
-      const upstream = await forwardRequest(target, targetPath, {
+      const upstream = await forwardWithRetry(route, balancer, targetPath, {
         method: request.method,
         headers: request.headers,
         body: hasBody ? (request.body as Readable) : undefined,
@@ -167,7 +184,15 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
         });
       }
 
-      request.log.error({ err, route: route.id, target }, 'upstream request failed');
+      if (err instanceof NoHealthyTargetError) {
+        return reply.code(503).send({
+          error: 'service_unavailable',
+          message: err.message,
+          requestId: request.id,
+        });
+      }
+
+      request.log.error({ err, route: route.id }, 'upstream request failed');
       return reply.code(502).send({
         error: 'bad_gateway',
         message: 'Upstream request failed.',
