@@ -10,7 +10,7 @@
     "packages/adapters/*"
   ],
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20.18.1"
   },
   "scripts": {
     "build": "tsc --build && node packages/core/scripts/copy-lua.mjs && node packages/gateway/scripts/copy-assets.mjs",
