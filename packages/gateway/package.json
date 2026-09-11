@@ -6,20 +6,24 @@
   "private": true,
   "main": "./dist/index.js",
   "scripts": {
-    "build": "tsc --build",
+    "build": "tsc --build && node scripts/copy-assets.mjs",
     "clean": "tsc --build --clean",
     "dev": "tsx watch src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "seed": "tsx scripts/seed.ts",
+    "revoke-key": "tsx scripts/revoke-key.ts"
   },
   "dependencies": {
     "@apigate/core": "*",
     "fastify": "^5.12.0",
     "ioredis": "^6.0.0",
     "js-yaml": "^4.3.1",
+    "pg": "^8.23.0",
     "undici": "^8.10.2",
     "zod": "^4.6.0"
   },
   "devDependencies": {
-    "@types/js-yaml": "^4.0.9"
+    "@types/js-yaml": "^4.0.9",
+    "@types/pg": "^8.23.1"
   }
 }

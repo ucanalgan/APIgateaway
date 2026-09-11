@@ -14,9 +14,20 @@ const upstreamSchema = z.object({
   timeoutMs: z.number().int().positive().default(5000),
 });
 
-const authSchema = z.object({
-  type: z.enum(['apiKey', 'jwt', 'none']).default('none'),
-});
+const authSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('none') }),
+  z.object({ type: z.literal('apiKey') }),
+  z.object({
+    type: z.literal('jwt'),
+    jwksUrl: z.string().url(),
+    issuer: z.string().optional(),
+    audience: z.string().optional(),
+    /** Bu claim'den tenantId okunur; yoksa `sub`'a düşer. Varsayılan: 'tenant_id'. */
+    tenantClaim: z.string().optional(),
+    /** Boşlukla ayrılmış string ya da dizi olabilir. Varsayılan: 'scope'. */
+    scopeClaim: z.string().optional(),
+  }),
+]);
 
 const rateLimitSchema = z.object({
   algorithm: z
@@ -86,6 +97,10 @@ const redisSchema = z.object({
   failOpen: z.boolean().default(true),
 });
 
+const dbSchema = z.object({
+  url: z.string().min(1),
+});
+
 export const gatewayConfigSchema = z.object({
   server: serverSchema.default({
     port: 8080,
@@ -95,6 +110,7 @@ export const gatewayConfigSchema = z.object({
     requestTimeoutMs: 30000,
   }),
   redis: redisSchema.optional(),
+  db: dbSchema.optional(),
   routes: z.array(routeSchema).default([]),
 });
 

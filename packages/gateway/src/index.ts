@@ -1,5 +1,6 @@
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import type { FastifyInstance } from 'fastify';
 import { loadConfig } from './config/load.js';
 import { buildServer } from './server.js';
 
@@ -10,9 +11,19 @@ import { buildServer } from './server.js';
 const defaultConfigPath = fileURLToPath(new URL('../../../gateway.yaml', import.meta.url));
 const configPath = process.env['GATEWAY_CONFIG'] ?? defaultConfigPath;
 const config = loadConfig(configPath);
-const server = buildServer(config);
 
-async function start(): Promise<void> {
+async function shutdown(server: FastifyInstance, signal: string): Promise<void> {
+  server.log.info(`${signal} received, shutting down`);
+  await server.close();
+  process.exit(0);
+}
+
+async function main(): Promise<void> {
+  const server = await buildServer(config);
+
+  process.on('SIGTERM', () => void shutdown(server, 'SIGTERM'));
+  process.on('SIGINT', () => void shutdown(server, 'SIGINT'));
+
   try {
     await server.listen({ port: config.server.port, host: '0.0.0.0' });
   } catch (err) {
@@ -21,13 +32,4 @@ async function start(): Promise<void> {
   }
 }
 
-async function shutdown(signal: string): Promise<void> {
-  server.log.info(`${signal} received, shutting down`);
-  await server.close();
-  process.exit(0);
-}
-
-process.on('SIGTERM', () => void shutdown('SIGTERM'));
-process.on('SIGINT', () => void shutdown('SIGINT'));
-
-void start();
+void main();

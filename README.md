@@ -22,8 +22,9 @@ about Fastify, Express, or HTTP itself. `packages/gateway` is the Fastify
 application that wires the core into an actual server.
 
 ```
-core/ratelimit  →  consume(key, policy) → { allowed, remaining, retryAfterMs }
-core/auth       →  verifyKey(raw)       → { tenantId, scopes } | null
+core/ratelimit  →  consume(key, policy)         → { allowed, remaining, retryAfterMs }
+core/auth       →  verifyApiKey(raw, lookup)     → { tenantId, scopes } | null
+                →  verifyJwt(token, jwksOptions) → { tenantId, scopes } | null
 core/breaker    →  CircuitBreaker class
 core/cache      →  get/set + Cache-Control interpretation
 ```
@@ -53,27 +54,32 @@ apigate/
 │  ├─ core/                  # framework-agnostic — the reusable part
 │  │  └─ src/
 │  │     ├─ ratelimit/       # algorithms, Store interface, Redis/memory stores
-│  │     ├─ auth/            # API key + JWT verification
+│  │     ├─ auth/            # API key + JWT verification primitives
 │  │     ├─ breaker/         # circuit breaker
 │  │     └─ cache/           # Cache-Control interpretation
 │  │
 │  ├─ adapters/               # core → framework glue (fastify, express)
 │  │
 │  └─ gateway/                # the actual application
-│     └─ src/
-│        ├─ config/           # gateway.yaml loading + Zod validation
-│        ├─ routing/          # route matcher + path rewrite
-│        ├─ proxy/            # undici-based forwarding
-│        ├─ security/         # request limits
-│        ├─ admin/            # tenant/key management API (planned)
-│        ├─ db/                # PostgreSQL client (planned)
-│        └─ observability/    # metrics + logging (planned)
+│     ├─ src/
+│     │  ├─ config/           # gateway.yaml loading + Zod validation
+│     │  ├─ routing/          # route matcher + path rewrite
+│     │  ├─ proxy/            # undici-based forwarding
+│     │  ├─ security/         # request limits
+│     │  ├─ auth/             # Postgres/Redis-backed key + JWT verification
+│     │  ├─ ratelimit/        # wires core's Store into requests, tenant/IP keys
+│     │  ├─ usage/            # buffered usage_records writer
+│     │  ├─ db/                # Postgres client, migrations, repositories
+│     │  ├─ admin/            # tenant/key management API (planned)
+│     │  └─ observability/    # metrics + logging (planned)
+│     └─ scripts/             # seed.ts, revoke-key.ts — see § Auth
 │
 ├─ examples/upstream/         # a bare-bones HTTP server used for local testing
 ├─ bench/                     # k6 load test scripts
 ├─ docker-compose.yml
 ├─ Dockerfile
-└─ gateway.yaml               # example config
+├─ gateway.yaml               # local-dev config — no external dependencies
+└─ gateway.docker.yaml        # config used by docker-compose (redis + postgres wired up)
 ```
 
 ## Getting started
@@ -113,7 +119,9 @@ curl http://localhost:8080/echo/hello   # proxied to the example upstream
 docker compose up --build
 ```
 
-This starts the gateway, Redis, PostgreSQL, and the example upstream together.
+This starts the gateway, Redis, PostgreSQL, and the example upstream together,
+using [gateway.docker.yaml](gateway.docker.yaml) (redis/db wired up, plus an
+`auth: apiKey` route) rather than the dependency-free root `gateway.yaml`.
 
 ## Configuration
 
@@ -149,16 +157,18 @@ routes:
 
 Every route needs an `id`, a `match.path` (an exact path, or a path ending in
 `/*` for a prefix match), and at least one `upstream.targets` entry.
-`cache`, `auth`, and `circuitBreaker` are being wired up in later phases — see
+`cache` and `circuitBreaker` are being wired up in later phases — see
 [Status](#status) below.
 
 ### Rate limiting
 
 A route with `rateLimit` gets one of five algorithms (`fixedWindow`,
-`tokenBucket`, `leakyBucket`, `slidingWindowLog`, `slidingWindowCounter`),
-keyed by client IP (`ip:<addr>:route:<id>`; tenant-based keys land with auth
-in a later phase). By default each route's counters live in an in-process
-memory store — enough for a single instance, and all `npm run dev` needs.
+`tokenBucket`, `leakyBucket`, `slidingWindowLog`, `slidingWindowCounter`).
+`keyBy` picks which counters apply — `ip` (`ip:<addr>:route:<id>`), `tenant`
+(`tenant:<id>:route:<id>`, needs `auth`), or both at once: every listed key
+is checked independently and the request is rejected if *any* of them is
+over quota. By default each route's counters live in an in-process memory
+store — enough for a single instance, and all `npm run dev` needs.
 
 Add a top-level `redis` block to share quota across multiple gateway
 instances instead (state moves into Redis, atomic via a Lua script per
@@ -172,6 +182,57 @@ redis:
 
 `docker-compose.yml` already runs a `redis` service if you want to try this
 locally.
+
+### Auth
+
+A route's `auth.type` is `none` (default), `apiKey`, or `jwt`. Either way the
+gateway reads `Authorization: Bearer <token>` and, on success, makes the
+resolved tenant available to `rateLimit: { keyBy: [tenant] }` above.
+
+**`apiKey`** needs a top-level `db` block (Postgres) — the gateway runs its
+own migrations on startup. Keys are `sha256` hashed at rest and compared with
+a constant-time check (never stored or logged in plaintext); a positive/negative
+verification cache lives in Redis when configured (60s TTL), invalidated
+immediately on revoke. The **rate limit for `keyBy: [tenant]` comes from the
+tenant's plan** (Postgres `plans.rate_limit/window_sec/burst`), not the
+route's static `rateLimit` config — that's what lets a `free` and a `pro`
+tenant hit the same route with different quotas.
+
+```bash
+# with db (and optionally redis) uncommented in gateway.yaml:
+npm run seed -w packages/gateway          # creates free/pro plans, a tenant, and a key
+npm run revoke-key -w packages/gateway -- <key-id>   # instant — clears the cache too
+```
+
+```yaml
+db:
+  url: postgres://apigate:apigate@localhost:5432/apigate
+
+routes:
+  - id: protected-api
+    match: { path: /api/* }
+    upstream: { targets: [http://localhost:4000] }
+    auth: { type: apiKey }
+    rateLimit: { algorithm: tokenBucket, keyBy: [tenant], limit: 100, windowSec: 60 }
+```
+
+**`jwt`** verifies against a JWKS endpoint (`jose`, with key rotation
+handled for you) — no database involved. `tenantId` comes from a configurable
+claim (default `tenant_id`, falling back to `sub`); scopes from `scope`
+(space-separated) or a configurable array claim.
+
+```yaml
+auth:
+  type: jwt
+  jwksUrl: https://your-idp.example/.well-known/jwks.json
+  issuer: https://your-idp.example/      # optional
+  audience: apigate                       # optional
+```
+
+Full usage per tenant (status code, latency, route) is buffered in memory and
+flushed to Postgres `usage_records` in batches (every 5s or 500 records,
+whichever first) rather than written synchronously per request — see
+[packages/gateway/src/usage/buffer.ts](packages/gateway/src/usage/buffer.ts).
 
 ## Response contract
 
@@ -187,6 +248,7 @@ Error responses share one shape:
 
 ```json
 { "error": "not_found", "message": "No route matches GET /nope.", "requestId": "..." }
+{ "error": "unauthorized", "message": "...", "requestId": "..." }
 { "error": "rate_limit_exceeded", "message": "...", "retryAfter": 12, "requestId": "..." }
 ```
 
@@ -198,15 +260,18 @@ npm run typecheck   # tsc --build, strict
 npm run test         # vitest
 ```
 
-The Redis-backed store's tests are real integration tests (no mocking — see
-PLAN's testing philosophy) and need a reachable Redis; they skip themselves
-if `REDIS_URL` (defaults to `redis://localhost:6379`) isn't reachable, so
-`npm test` still works without Docker. Point `REDIS_URL` at a real instance
-to run them, e.g.:
+The Redis- and Postgres-backed tests are real integration tests (no mocking —
+see PLAN's testing philosophy): the Postgres ones create and drop their own
+throwaway database per run. Both skip themselves if `REDIS_URL` (default
+`redis://localhost:6379`) / `POSTGRES_URL` (default
+`postgres://postgres:postgres@localhost:5432/postgres`) aren't reachable, so
+`npm test` still works without Docker. Point them at real instances to run
+everything:
 
 ```bash
 docker run -d --rm -p 6379:6379 redis:7-alpine
-REDIS_URL=redis://localhost:6379 npm run test
+docker run -d --rm -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16-alpine
+REDIS_URL=redis://localhost:6379 POSTGRES_URL=postgres://postgres:postgres@localhost:5432/postgres npm run test
 ```
 
 ## Benchmarking
@@ -231,11 +296,16 @@ of them come online.
       bodies, request ID propagation, header-count limits
 - [x] **Rate limiting** — all five algorithms, in-process memory store or
       distributed Redis store (atomic via Lua, proven against a real Redis —
-      see `packages/core/test/ratelimit`), standard headers + 429 contract.
-      IP-keyed only for now; tenant keys and the Redis-down `failOpen`
-      behavior land with auth and resilience below.
-- [ ] **Auth** — API key and JWT verification, tenant-based quotas
-- [ ] **Resilience** — circuit breaker, load balancing, retries
+      see `packages/core/test/ratelimit`), standard headers + 429 contract,
+      IP- and/or tenant-keyed. The Redis-down `failOpen` behavior isn't
+      enforced yet — see Resilience below.
+- [x] **Auth** — API key (Postgres-backed, sha256 + constant-time compare,
+      Redis verification cache with instant revoke invalidation) and JWT
+      (JWKS) verification; tenant-scoped, plan-driven rate limits; buffered
+      usage recording. See `packages/gateway/test/db.test.ts` and
+      `packages/core/test/auth`.
+- [ ] **Resilience** — circuit breaker, load balancing, retries, the
+      Redis-down `failOpen` policy
 - [ ] **Cache** — Cache-Control-aware response caching
 - [ ] **Admin API + observability** — tenant/key management, Prometheus
       metrics

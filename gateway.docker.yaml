@@ -1,0 +1,53 @@
+# Used by docker-compose.yml, where redis/postgres/upstream are all real
+# services reachable by name. See gateway.yaml for the plain local-dev config
+# (no external dependencies) that this is a fuller sibling of.
+server:
+  port: 8080
+  trustProxyHops: 1
+  maxBodyBytes: 1048576
+  maxHeaderCount: 100
+  requestTimeoutMs: 30000
+
+redis:
+  url: redis://redis:6379
+  failOpen: true
+
+db:
+  url: postgres://apigate:apigate@postgres:5432/apigate
+
+routes:
+  - id: echo-upstream
+    match:
+      path: /echo/*
+    rewrite:
+      stripPrefix: /echo
+    upstream:
+      targets:
+        - http://upstream:4000
+      timeoutMs: 5000
+    rateLimit:
+      algorithm: tokenBucket
+      keyBy: [ip]
+      limit: 10
+      windowSec: 60
+
+  # redis/postgres are also published to the host (see docker-compose.yml),
+  # so seed from your machine against gateway.yaml with its `redis`/`db`
+  # blocks uncommented: `npm run seed -w packages/gateway`, then:
+  #   curl -H "Authorization: Bearer <raw key from seed output>" http://localhost:8080/api/hello
+  - id: protected-api
+    match:
+      path: /api/*
+    rewrite:
+      stripPrefix: /api
+    upstream:
+      targets:
+        - http://upstream:4000
+      timeoutMs: 5000
+    auth:
+      type: apiKey
+    rateLimit:
+      algorithm: tokenBucket
+      keyBy: [tenant]
+      limit: 100
+      windowSec: 60

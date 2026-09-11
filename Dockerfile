@@ -21,7 +21,7 @@ COPY packages/gateway/package.json packages/gateway/package.json
 RUN npm ci --omit=dev --workspace=@apigate/core --workspace=@apigate/gateway
 COPY --from=build /app/packages/core/dist packages/core/dist
 COPY --from=build /app/packages/gateway/dist packages/gateway/dist
-COPY gateway.yaml ./
+COPY gateway.yaml gateway.docker.yaml ./
 
 EXPOSE 8080
 CMD ["node", "packages/gateway/dist/index.js"]

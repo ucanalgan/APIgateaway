@@ -13,6 +13,12 @@ server:
 #   url: redis://localhost:6379
 #   failOpen: true
 
+# Needed only by routes with `auth: { type: apiKey }` below — the gateway
+# runs its own migrations against this on startup. `npm run seed` creates a
+# free/pro plan, a tenant, and prints a raw key to try against such a route.
+# db:
+#   url: postgres://apigate:apigate@localhost:5432/apigate
+
 routes:
   - id: echo-upstream
     match:
@@ -28,4 +34,13 @@ routes:
       keyBy: [ip]
       limit: 10
       windowSec: 60
+
+  # Uncomment this alongside `db:` (and `redis:`, for a shared cache) to try
+  # API-key auth with tenant/plan-driven rate limits (see README § Auth).
+  # - id: protected-api
+  #   match: { path: /api/* }
+  #   rewrite: { stripPrefix: /api }
+  #   upstream: { targets: [http://localhost:4000] }
+  #   auth: { type: apiKey }
+  #   rateLimit: { algorithm: tokenBucket, keyBy: [tenant], limit: 100, windowSec: 60 }
 

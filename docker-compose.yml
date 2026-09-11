@@ -25,8 +25,7 @@ services:
   gateway:
     build: .
     environment:
-      GATEWAY_CONFIG: /app/gateway.yaml
-      REDIS_URL: redis://redis:6379
+      GATEWAY_CONFIG: /app/gateway.docker.yaml
     ports:
       - "8080:8080"
     depends_on:

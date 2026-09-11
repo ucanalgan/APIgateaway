@@ -1,21 +1,18 @@
-import { Redis } from 'ioredis';
-import { createMemoryStore, createRedisStore, type Policy, type Store } from '@apigate/core/ratelimit';
+import type { Redis } from 'ioredis';
+import { createMemoryStore, createRedisStore, type Policy, type RateLimitResult, type Store } from '@apigate/core/ratelimit';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { GatewayConfig, RouteConfig } from '../config/schema.js';
+import type { TenantPlan } from '../auth/index.js';
 
 /**
- * `config.redis` verilmişse tüm rate-limited route'lar tek bir Redis
- * bağlantısını paylaşır (distributed — birden fazla gateway instance'ı aynı
- * kotayı görür). Verilmemişse her route kendi in-process memory store'unu
- * alır (tek instance için yeterli, bkz. PLAN.md §5).
+ * `redisClient` verilmişse (config.redis + auth ya da rate limit onu
+ * gerektiriyorsa) tüm rate-limited route'lar onu paylaşır — distributed.
+ * Verilmemişse her route kendi in-process memory store'unu alır.
  */
-export function createRateLimitStores(config: GatewayConfig): Map<string, Store> {
-  const rateLimitedRoutes = config.routes.filter((route) => route.rateLimit);
-  const redisClient =
-    config.redis && rateLimitedRoutes.length > 0 ? new Redis(config.redis.url) : undefined;
+export function createRateLimitStores(config: GatewayConfig, redisClient: Redis | undefined): Map<string, Store> {
   const stores = new Map<string, Store>();
 
-  for (const route of rateLimitedRoutes) {
+  for (const route of config.routes) {
     if (!route.rateLimit) continue;
 
     const store = redisClient
@@ -28,37 +25,66 @@ export function createRateLimitStores(config: GatewayConfig): Map<string, Store>
   return stores;
 }
 
+export interface RateLimitContext {
+  /** Auth başarılıysa dolu — bkz. auth/index.ts. */
+  readonly tenantId?: string;
+  /** apiKey auth'ta plan tablosundan gelir; doluysa route config yerine bunu kullan. */
+  readonly tenantPlan?: TenantPlan;
+}
+
 /**
- * Bu route için limiti tüketir, standart header'ları yazar ve aşılmışsa
- * 429 gönderir. `false` dönerse handler zaten yanıt verdi demektir — çağıran
- * proxy'lemeye devam etmemeli.
+ * Route'un `keyBy` listesindeki her stratejiyi ayrı ayrı tüketir (bkz.
+ * PLAN.md §5: "Üçü aynı anda uygulanabilir; herhangi biri reddederse istek
+ * reddedilir"). Standart header'ları yazar; aşılmışsa 429 gönderir.
+ * `false` dönerse handler zaten yanıt verdi demektir.
  */
 export async function enforceRateLimit(
   store: Store,
   route: RouteConfig,
   request: FastifyRequest,
   reply: FastifyReply,
+  context: RateLimitContext = {},
 ): Promise<boolean> {
   const config = route.rateLimit;
   if (!config) return true;
 
-  const policy: Policy = {
+  const routePolicy: Policy = {
     limit: config.limit,
     windowMs: config.windowSec * 1000,
     ...(config.burst !== undefined ? { burst: config.burst } : {}),
   };
 
-  // Faz 3 kapsamı sadece IP bazlı anahtarlama — tenant bazlı limit auth'a
-  // bağımlı (bkz. PLAN.md Faz 4).
-  const key = `ip:${request.ip}:route:${route.id}`;
-  const result = await store.consume(key, policy);
+  const checks: Array<{ key: string; policy: Policy }> = [];
 
-  reply.header('RateLimit-Limit', result.limit);
-  reply.header('RateLimit-Remaining', result.remaining);
-  reply.header('RateLimit-Reset', Math.ceil(result.retryAfterMs / 1000));
+  for (const strategy of config.keyBy) {
+    if (strategy === 'ip') {
+      checks.push({ key: `ip:${request.ip}:route:${route.id}`, policy: routePolicy });
+    } else if (context.tenantId) {
+      const plan = context.tenantPlan;
+      checks.push({
+        key: `tenant:${context.tenantId}:route:${route.id}`,
+        policy: plan
+          ? { limit: plan.limit, windowMs: plan.windowSec * 1000, burst: plan.burst }
+          : routePolicy,
+      });
+    }
+    // keyBy içinde 'tenant' var ama istek anonimse o strateji sessizce atlanır
+    // — anonim istek zaten auth katmanında reddedilmiş olurdu (route auth
+    // gerektiriyorsa), yoksa tenant'sız kontrol edilecek bir şey yok.
+  }
 
-  if (!result.allowed) {
-    const retryAfterSec = Math.ceil(result.retryAfterMs / 1000);
+  if (checks.length === 0) return true;
+
+  const results = await Promise.all(checks.map((check) => store.consume(check.key, check.policy)));
+  const rejected = results.find((r) => !r.allowed);
+  const reported: RateLimitResult = rejected ?? results[0]!;
+
+  reply.header('RateLimit-Limit', reported.limit);
+  reply.header('RateLimit-Remaining', reported.remaining);
+  reply.header('RateLimit-Reset', Math.ceil(reported.retryAfterMs / 1000));
+
+  if (rejected) {
+    const retryAfterSec = Math.ceil(rejected.retryAfterMs / 1000);
     reply.header('Retry-After', retryAfterSec);
     await reply.code(429).send({
       error: 'rate_limit_exceeded',
