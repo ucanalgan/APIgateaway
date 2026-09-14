@@ -7,6 +7,7 @@ server:
   maxBodyBytes: 1048576
   maxHeaderCount: 100
   requestTimeoutMs: 30000
+  watch: true
 
 redis:
   url: redis://redis:6379
@@ -14,6 +15,11 @@ redis:
 
 db:
   url: postgres://apigate:apigate@postgres:5432/apigate
+
+# Demo-only secret, fine to hardcode alongside the demo db/redis creds above
+# — see README § Admin API for what this unlocks and how it's checked.
+admin:
+  token: apigate-admin-demo-token
 
 routes:
   # Two targets + health check + breaker + retry — stop one
@@ -66,8 +72,8 @@ routes:
       windowSec: 60
 
   # Second GET to the same path comes back with X-Cache: HIT and never
-  # touches upstream (see README § Cache). setHeaders/removeHeaders run on
-  # the outbound request either way, cached or not.
+  # touches upstream (see README § Cache). setHeaders/removeHeaders only run
+  # on a miss — a hit skips the outbound request entirely.
   - id: cached-echo
     match:
       path: /cached/*

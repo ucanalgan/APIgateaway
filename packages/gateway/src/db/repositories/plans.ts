@@ -45,6 +45,26 @@ export async function createPlan(pool: DbPool, input: CreatePlanInput): Promise<
   };
 }
 
+export async function listPlans(pool: DbPool): Promise<Plan[]> {
+  const { rows } = await pool.query<{
+    id: string;
+    name: string;
+    rate_limit: number;
+    window_sec: number;
+    burst: number;
+    quota_monthly: string | null;
+  }>('SELECT id, name, rate_limit, window_sec, burst, quota_monthly FROM plans ORDER BY name');
+
+  return rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    rateLimit: row.rate_limit,
+    windowSec: row.window_sec,
+    burst: row.burst,
+    quotaMonthly: row.quota_monthly === null ? null : Number(row.quota_monthly),
+  }));
+}
+
 export async function findPlanByName(pool: DbPool, name: string): Promise<Plan | null> {
   const { rows } = await pool.query<{
     id: string;

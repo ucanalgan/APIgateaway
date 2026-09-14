@@ -76,6 +76,49 @@ export async function findActiveApiKeyWithPlan(pool: DbPool, keyHash: string): P
   };
 }
 
+export interface ApiKeySummary {
+  readonly id: string;
+  readonly tenantId: string;
+  /** Ham key ve hash asla dönmez — sadece UI'da tanınabilirlik için prefix. */
+  readonly prefix: string;
+  readonly name: string | null;
+  readonly scopes: readonly string[];
+  readonly lastUsedAt: string | null;
+  readonly expiresAt: string | null;
+  readonly revokedAt: string | null;
+  readonly createdAt: string;
+}
+
+export async function listApiKeysForTenant(pool: DbPool, tenantId: string): Promise<ApiKeySummary[]> {
+  const { rows } = await pool.query<{
+    id: string;
+    tenant_id: string;
+    key_prefix: string;
+    name: string | null;
+    scopes: string[];
+    last_used_at: string | null;
+    expires_at: string | null;
+    revoked_at: string | null;
+    created_at: string;
+  }>(
+    `SELECT id, tenant_id, key_prefix, name, scopes, last_used_at, expires_at, revoked_at, created_at
+     FROM api_keys WHERE tenant_id = $1 ORDER BY created_at DESC`,
+    [tenantId],
+  );
+
+  return rows.map((row) => ({
+    id: row.id,
+    tenantId: row.tenant_id,
+    prefix: row.key_prefix,
+    name: row.name,
+    scopes: row.scopes,
+    lastUsedAt: row.last_used_at,
+    expiresAt: row.expires_at,
+    revokedAt: row.revoked_at,
+    createdAt: row.created_at,
+  }));
+}
+
 export async function touchApiKeyLastUsed(pool: DbPool, id: string): Promise<void> {
   await pool.query('UPDATE api_keys SET last_used_at = now() WHERE id = $1', [id]);
 }

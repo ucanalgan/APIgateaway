@@ -79,4 +79,25 @@ describe('createBalancer', () => {
 
     balancer.close();
   });
+
+  it('reports circuitState as undefined when no breaker is configured', () => {
+    const balancer = createBalancer(routeWithTargets(['http://a']));
+    expect(balancer.getTargetStates()).toEqual([{ url: 'http://a', healthy: true, circuitState: undefined }]);
+    balancer.close();
+  });
+
+  it('reports circuitState reflecting the real breaker state', () => {
+    const balancer = createBalancer(
+      routeWithTargets(['http://a', 'http://b'], { failureThreshold: 2, resetTimeoutMs: 1000 }),
+    );
+
+    balancer.reportFailure('http://a');
+    balancer.reportFailure('http://a');
+
+    const states = balancer.getTargetStates();
+    expect(states.find((s) => s.url === 'http://a')?.circuitState).toBe('open');
+    expect(states.find((s) => s.url === 'http://b')?.circuitState).toBe('closed');
+
+    balancer.close();
+  });
 });

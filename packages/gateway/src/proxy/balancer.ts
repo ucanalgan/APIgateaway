@@ -8,11 +8,20 @@ interface TargetState {
   readonly breaker: CircuitBreaker | undefined;
 }
 
+export interface TargetSnapshot {
+  readonly url: string;
+  readonly healthy: boolean;
+  /** `undefined` — bu route'ta circuitBreaker yapılandırılmamış. */
+  readonly circuitState: 'closed' | 'open' | 'half-open' | undefined;
+}
+
 export interface Balancer {
   /** Round-robin ile sıradaki müsait target'ı döner; hiçbiri müsait değilse `undefined`. */
   pickTarget(): string | undefined;
   reportSuccess(target: string): void;
   reportFailure(target: string): void;
+  /** Metrik scrape'i için anlık durum — `/metrics` bunu okuyup gauge'ları tazeler. */
+  getTargetStates(): readonly TargetSnapshot[];
   /** Health check interval'ini durdurur — graceful shutdown'da çağır. */
   close(): void;
 }
@@ -65,6 +74,14 @@ export function createBalancer(route: RouteConfig): Balancer {
 
     reportFailure(url: string): void {
       targets.find((target) => target.url === url)?.breaker?.recordFailure();
+    },
+
+    getTargetStates(): readonly TargetSnapshot[] {
+      return targets.map((target) => ({
+        url: target.url,
+        healthy: target.healthy,
+        circuitState: target.breaker?.getState(),
+      }));
     },
 
     close(): void {

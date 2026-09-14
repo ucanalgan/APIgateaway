@@ -6,7 +6,19 @@ describe('gatewayConfigSchema', () => {
     const result = gatewayConfigSchema.parse({});
 
     expect(result.server.port).toBe(8080);
+    expect(result.server.watch).toBe(false);
     expect(result.routes).toEqual([]);
+    expect(result.admin).toBeUndefined();
+  });
+
+  it('accepts an admin token', () => {
+    const result = gatewayConfigSchema.parse({ admin: { token: 'secret' } });
+    expect(result.admin).toEqual({ token: 'secret' });
+  });
+
+  it('rejects an empty admin token', () => {
+    const result = gatewayConfigSchema.safeParse({ admin: { token: '' } });
+    expect(result.success).toBe(false);
   });
 
   it('rejects a route without an upstream target', () => {

@@ -4,10 +4,11 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { Redis } from 'ioredis';
 import { decideCacheability } from '@apigate/core/cache';
 import type { GatewayConfig } from './config/schema.js';
+import { watchConfig } from './config/watch.js';
 import { matchRoute } from './routing/matcher.js';
 import { rewritePath } from './routing/rewrite.js';
 import { UpstreamTimeoutError } from './proxy/forward.js';
-import { createBalancer } from './proxy/balancer.js';
+import { createBalancer, type Balancer } from './proxy/balancer.js';
 import { forwardWithRetry, NoHealthyTargetError } from './proxy/retry.js';
 import { applyRequestTransform } from './proxy/transform.js';
 import { bufferStream } from './proxy/bufferStream.js';
@@ -15,8 +16,13 @@ import { enforceHeaderLimit } from './security/limits.js';
 import { createRateLimitStores, enforceRateLimit } from './ratelimit/index.js';
 import { authenticateRequest } from './auth/index.js';
 import { createCacheStores, buildCacheKey, stripUncacheableHeaders } from './cache/index.js';
-import { createDbPool, runMigrations } from './db/client.js';
+import { createDbPool, runMigrations, type DbPool } from './db/client.js';
 import { createUsageBuffer } from './usage/buffer.js';
+import { createMetrics } from './observability/metrics.js';
+import { REDACT_PATHS } from './observability/logger.js';
+import { registerAdminRoutes } from './admin/routes.js';
+import type { Store } from '@apigate/core/ratelimit';
+import type { CacheStore } from '@apigate/core/cache';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -25,32 +31,72 @@ declare module 'fastify' {
   }
 }
 
-export async function buildServer(config: GatewayConfig): Promise<FastifyInstance> {
-  const apiKeyRoutes = config.routes.filter((route) => route.auth.type === 'apiKey');
-  if (apiKeyRoutes.length > 0 && !config.db) {
-    throw new Error(
-      `Route(s) ${apiKeyRoutes.map((route) => route.id).join(', ')} use auth.type "apiKey" but no top-level ` +
-        '"db" config is set.',
-    );
+function apiKeyRoutesNeedingDb(config: GatewayConfig): string[] {
+  return config.routes.filter((route) => route.auth.type === 'apiKey').map((route) => route.id);
+}
+
+/**
+ * Fastify'ın kendisi (port, body limit, request timeout, admin route'ları)
+ * boot'ta sabitlenir — sadece `routes` (ve ondan türeyen balancer/store'lar)
+ * hot-reload edilebilir. `redis`/`db`/`admin`/`server` değiştiyse reload
+ * reddedilir (bkz. PLAN.md §7 "yeni config doğrulamayı geçemezse eskisi
+ * korunur" — burada "geçmemek" bunu da kapsıyor).
+ */
+function assertHotReloadable(oldConfig: GatewayConfig, newConfig: GatewayConfig): void {
+  const immutableSections: Array<keyof GatewayConfig> = ['server', 'redis', 'db', 'admin'];
+  for (const key of immutableSections) {
+    if (JSON.stringify(oldConfig[key]) !== JSON.stringify(newConfig[key])) {
+      throw new Error(`Config section "${key}" changed — this requires a restart, not a hot-reload.`);
+    }
+  }
+
+  const missingDb = apiKeyRoutesNeedingDb(newConfig);
+  if (missingDb.length > 0 && !newConfig.db) {
+    throw new Error(`Route(s) ${missingDb.join(', ')} use auth.type "apiKey" but no top-level "db" config is set.`);
+  }
+}
+
+interface RuntimeState {
+  readonly config: GatewayConfig;
+  readonly rateLimitStores: Map<string, Store>;
+  readonly cacheStores: Map<string, CacheStore>;
+  readonly balancers: Map<string, Balancer>;
+}
+
+function buildRuntimeState(config: GatewayConfig, redisClient: Redis | undefined): RuntimeState {
+  return {
+    config,
+    rateLimitStores: createRateLimitStores(config, redisClient),
+    cacheStores: createCacheStores(config, redisClient),
+    balancers: new Map(config.routes.map((route) => [route.id, createBalancer(route)])),
+  };
+}
+
+export async function buildServer(initialConfig: GatewayConfig, configPath: string): Promise<FastifyInstance> {
+  const missingDb = apiKeyRoutesNeedingDb(initialConfig);
+  if (missingDb.length > 0 && !initialConfig.db) {
+    throw new Error(`Route(s) ${missingDb.join(', ')} use auth.type "apiKey" but no top-level "db" config is set.`);
   }
 
   const needsRedis =
-    config.redis &&
-    (config.routes.some((route) => route.rateLimit || route.cache?.enabled) || apiKeyRoutes.length > 0);
+    initialConfig.redis &&
+    (initialConfig.routes.some((route) => route.rateLimit || route.cache?.enabled) || missingDb.length > 0);
   // `failOpen`/the auth cache fallback need commands to fail *fast* when
   // Redis is unreachable. ioredis's default is the opposite — it queues
   // commands indefinitely while reconnecting, so a down Redis would hang
   // every request instead of tripping either fallback.
   const redisClient = needsRedis
-    ? new Redis(config.redis!.url, { enableOfflineQueue: false, maxRetriesPerRequest: 1, connectTimeout: 2000 })
+    ? new Redis(initialConfig.redis!.url, { enableOfflineQueue: false, maxRetriesPerRequest: 1, connectTimeout: 2000 })
     : undefined;
 
-  const dbPool = config.db && apiKeyRoutes.length > 0 ? createDbPool(config.db.url) : undefined;
+  const dbPool: DbPool | undefined =
+    initialConfig.db && (missingDb.length > 0 || initialConfig.admin) ? createDbPool(initialConfig.db.url) : undefined;
   if (dbPool) await runMigrations(dbPool);
 
   const usageBuffer = dbPool ? createUsageBuffer(dbPool) : undefined;
+  const metrics = createMetrics();
 
-  const trustProxyHops = config.server.trustProxyHops;
+  const trustProxyHops = initialConfig.server.trustProxyHops;
   // "N hop güvenilir" demek: bizim doğrudan bağlandığımız taraf (hop 0) ve
   // ondan sonraki N-1 ara proxy güvenilir kabul edilir; X-Forwarded-For'daki
   // ilk güvenilmeyen adres gerçek client sayılır. Güvenlik varsayımı ağ
@@ -64,10 +110,10 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
     trustProxyHops > 0 ? (_address, hop) => hop < trustProxyHops : false;
 
   const app = Fastify({
-    logger: true,
+    logger: { redact: { paths: REDACT_PATHS, censor: '[redacted]' } },
     trustProxy,
-    bodyLimit: config.server.maxBodyBytes,
-    requestTimeout: config.server.requestTimeoutMs,
+    bodyLimit: initialConfig.server.maxBodyBytes,
+    requestTimeout: initialConfig.server.requestTimeoutMs,
     requestIdHeader: 'x-request-id',
     genReqId: () => randomUUID(),
   });
@@ -89,43 +135,91 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
     done(null, payload);
   });
 
-  app.addHook('onRequest', enforceHeaderLimit(config.server.maxHeaderCount));
+  app.addHook('onRequest', enforceHeaderLimit(initialConfig.server.maxHeaderCount));
   app.addHook('onSend', async (request, reply, payload) => {
     reply.header('x-request-id', request.id);
     return payload;
   });
 
-  if (usageBuffer) {
-    app.addHook('onResponse', async (request, reply) => {
-      if (!request.apigateTenantId || !request.apigateRouteId) return;
+  app.addHook('onResponse', async (request, reply) => {
+    metrics.recordRequest(
+      request.apigateRouteId ?? 'unmatched',
+      reply.statusCode,
+      reply.elapsedTime / 1000,
+      request.apigateTenantId,
+    );
+
+    if (usageBuffer && request.apigateTenantId && request.apigateRouteId) {
       usageBuffer.push({
         tenantId: request.apigateTenantId,
         routeId: request.apigateRouteId,
         statusCode: reply.statusCode,
         latencyMs: Math.round(reply.elapsedTime),
       });
+    }
+  });
+
+  let state = buildRuntimeState(initialConfig, redisClient);
+
+  function reload(newConfig: GatewayConfig): void {
+    assertHotReloadable(state.config, newConfig);
+
+    const oldBalancers = state.balancers;
+    // Redis-backed store'ların `.close()`'u paylaşılan `redisClient`'ı
+    // kapatır — o yüzden eski store'ları KAPATMIYORUZ, sadece bırakıyoruz
+    // (garbage collected). Balancer'lar ise kendi health-check interval'ini
+    // tutuyor, bu gerçekten kapatılmalı yoksa her reload bir timer sızdırır.
+    state = buildRuntimeState(newConfig, redisClient);
+    for (const balancer of oldBalancers.values()) balancer.close();
+
+    app.log.info({ routes: newConfig.routes.map((route) => route.id) }, 'config reloaded');
+  }
+
+  const configWatcher = watchConfig(configPath, {
+    onReload: reload,
+    onError: (err) => app.log.error({ err }, 'config reload failed — keeping the previous config'),
+    watchFile: initialConfig.server.watch,
+  });
+
+  if (initialConfig.admin && dbPool) {
+    await registerAdminRoutes(app, initialConfig.admin.token, {
+      db: dbPool,
+      ...(redisClient !== undefined ? { redis: redisClient } : {}),
     });
   }
 
-  const rateLimitStores = createRateLimitStores(config, redisClient);
-  const cacheStores = createCacheStores(config, redisClient);
-  const balancers = new Map(config.routes.map((route) => [route.id, createBalancer(route)]));
-  const failOpen = config.redis?.failOpen ?? true;
-
   app.addHook('onClose', async () => {
-    await Promise.all([...rateLimitStores.values()].map((store) => store.close()));
-    await Promise.all([...cacheStores.values()].map((store) => store.close()));
-    for (const balancer of balancers.values()) balancer.close();
+    configWatcher.close();
+    for (const balancer of state.balancers.values()) balancer.close();
     await usageBuffer?.close();
     await dbPool?.end();
     if (redisClient) await redisClient.quit();
   });
 
-  app.get('/health', async () => ({ status: 'ok' }));
+  app.get('/health', async (request) => {
+    request.apigateRouteId = '__health__';
+    return { status: 'ok' };
+  });
+
+  app.get('/metrics', async (request, reply) => {
+    request.apigateRouteId = '__metrics__';
+    // Gauge'lar (circuit state, upstream healthy) event-driven değil —
+    // scrape anında balancer'ların gerçek durumundan tazeleniyor. Bu,
+    // Prometheus'un pull-model'i için standart yaklaşım.
+    for (const [routeId, balancer] of state.balancers) {
+      for (const target of balancer.getTargetStates()) {
+        metrics.setUpstreamHealthy(routeId, target.url, target.healthy);
+        if (target.circuitState) metrics.setCircuitState(routeId, target.circuitState);
+      }
+    }
+
+    reply.header('content-type', metrics.registry.contentType);
+    return metrics.registry.metrics();
+  });
 
   app.all('/*', async (request, reply) => {
     const path = request.url.split('?')[0] ?? '/';
-    const route = matchRoute(config.routes, { method: request.method, path });
+    const route = matchRoute(state.config.routes, { method: request.method, path });
 
     if (!route) {
       return reply.code(404).send({
@@ -135,6 +229,8 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
       });
     }
 
+    request.apigateRouteId = route.id;
+
     const authOutcome = await authenticateRequest(route, request, reply, {
       ...(dbPool !== undefined ? { db: dbPool } : {}),
       ...(redisClient !== undefined ? { redis: redisClient } : {}),
@@ -143,12 +239,12 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
 
     if (authOutcome.tenantId) {
       request.apigateTenantId = authOutcome.tenantId;
-      request.apigateRouteId = route.id;
     }
 
     if (route.rateLimit) {
-      const store = rateLimitStores.get(route.id);
+      const store = state.rateLimitStores.get(route.id);
       if (store) {
+        const startedAt = process.hrtime.bigint();
         const proceed = await enforceRateLimit(
           store,
           route,
@@ -158,21 +254,27 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
             ...(authOutcome.tenantId !== undefined ? { tenantId: authOutcome.tenantId } : {}),
             ...(authOutcome.plan !== undefined ? { tenantPlan: authOutcome.plan } : {}),
           },
-          failOpen,
+          state.config.redis?.failOpen ?? true,
         );
+        metrics.observeRedisLatency(Number(process.hrtime.bigint() - startedAt) / 1e9);
+        metrics.recordRateLimitDecision(route.id, proceed ? 'allowed' : 'blocked');
         if (!proceed) return reply;
       }
     }
 
-    const cacheStore = route.cache?.enabled ? cacheStores.get(route.id) : undefined;
+    const cacheStore = route.cache?.enabled ? state.cacheStores.get(route.id) : undefined;
     const cacheKey =
       cacheStore && request.method === 'GET'
         ? buildCacheKey(route, request.method, path, request.headers, authOutcome.tenantId)
         : undefined;
 
     if (cacheStore && cacheKey) {
+      const startedAt = process.hrtime.bigint();
       const cached = await cacheStore.get(cacheKey);
+      metrics.observeRedisLatency(Number(process.hrtime.bigint() - startedAt) / 1e9);
+
       if (cached) {
+        metrics.recordCacheResult(route.id, 'hit');
         reply.header('X-Cache', 'HIT');
         reply.code(cached.statusCode);
         for (const [key, value] of Object.entries(cached.headers)) {
@@ -183,7 +285,7 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
     }
 
     const targetPath = rewritePath(request.url, route);
-    const balancer = balancers.get(route.id)!;
+    const balancer = state.balancers.get(route.id)!;
     const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
 
     try {
@@ -205,19 +307,24 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
         // Cache'lemek için tam gövdeyi okumamız gerekiyor — bu route'a özel,
         // bilinçli bir buffering istisnası (bkz. README § Resilience'daki
         // retry buffer'lama ile aynı gerekçe).
+        metrics.recordCacheResult(route.id, 'miss');
         reply.header('X-Cache', 'MISS');
         const body = await bufferStream(upstream.body);
         const decision = decideCacheability(upstream.statusCode, upstream.headers, route.cache!.ttlSec);
 
-        if (decision.cacheable && body.byteLength <= config.server.maxBodyBytes) {
+        if (decision.cacheable && body.byteLength <= state.config.server.maxBodyBytes) {
           const cached = {
             statusCode: upstream.statusCode,
             headers: stripUncacheableHeaders(upstream.headers),
             body,
           };
-          cacheStore.set(cacheKey, cached, decision.ttlSec).catch((err: unknown) => {
-            request.log.warn({ err, route: route.id }, 'failed to write cache entry');
-          });
+          const setStartedAt = process.hrtime.bigint();
+          cacheStore
+            .set(cacheKey, cached, decision.ttlSec)
+            .then(() => metrics.observeRedisLatency(Number(process.hrtime.bigint() - setStartedAt) / 1e9))
+            .catch((err: unknown) => {
+              request.log.warn({ err, route: route.id }, 'failed to write cache entry');
+            });
         }
 
         return reply.send(body);
@@ -226,6 +333,7 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
       return reply.send(upstream.body);
     } catch (err) {
       if (err instanceof UpstreamTimeoutError) {
+        metrics.recordUpstreamError(route.id, 'timeout');
         return reply.code(504).send({
           error: 'upstream_timeout',
           message: err.message,
@@ -234,6 +342,7 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
       }
 
       if (err instanceof NoHealthyTargetError) {
+        metrics.recordUpstreamError(route.id, 'no_healthy_target');
         return reply.code(503).send({
           error: 'service_unavailable',
           message: err.message,
@@ -241,6 +350,7 @@ export async function buildServer(config: GatewayConfig): Promise<FastifyInstanc
         });
       }
 
+      metrics.recordUpstreamError(route.id, 'connection');
       request.log.error({ err, route: route.id }, 'upstream request failed');
       return reply.code(502).send({
         error: 'bad_gateway',

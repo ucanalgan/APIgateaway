@@ -71,8 +71,8 @@ apigate/
 │     │  ├─ cache/            # cache key building, tenant isolation
 │     │  ├─ usage/            # buffered usage_records writer
 │     │  ├─ db/                # Postgres client, migrations, repositories
-│     │  ├─ admin/            # tenant/key management API (planned)
-│     │  └─ observability/    # metrics + logging (planned)
+│     │  ├─ admin/            # /admin/* — tenant/plan/key CRUD, its own auth
+│     │  └─ observability/    # Prometheus metrics, log redaction
 │     └─ scripts/             # seed.ts, revoke-key.ts — see § Auth
 │
 ├─ examples/upstream/         # a bare-bones HTTP server used for local testing
@@ -80,7 +80,8 @@ apigate/
 ├─ docker-compose.yml
 ├─ Dockerfile
 ├─ gateway.yaml               # local-dev config — no external dependencies
-└─ gateway.docker.yaml        # config used by docker-compose (redis + postgres wired up)
+├─ gateway.docker.yaml        # config used by docker-compose (redis + postgres wired up)
+└─ grafana-dashboard.json     # importable dashboard for the /metrics below
 ```
 
 ## Getting started
@@ -112,6 +113,7 @@ Try it against the example upstream fixture:
 node examples/upstream/index.js   # fake backend on :4000, in another terminal
 curl http://localhost:8080/health
 curl http://localhost:8080/echo/hello   # proxied to the example upstream
+curl http://localhost:8080/metrics       # Prometheus text format, always on
 ```
 
 ### Run with Docker Compose
@@ -318,7 +320,63 @@ API-key auth cache degrades the same way regardless of `failOpen` — a
 down Redis just means every request falls back to Postgres instead of
 failing outright, since the cache was only ever an optimization.
 
-## Response contract
+### Admin API
+
+A top-level `admin` block turns on `/admin/*` — a real CRUD API for plans,
+tenants, and keys, entirely separate from the proxy pipeline (it needs
+`db`; JSON bodies work normally here, unlike the rest of the gateway which
+proxies bodies as raw streams). It's protected by a single operator secret,
+not the tenant `apiKey`/`jwt` auth above — admin actions aren't scoped to a
+tenant, so reusing tenant auth for them would be a conceptual (and
+practical) mismatch:
+
+```yaml
+admin:
+  token: a-long-random-operator-secret   # Authorization: Bearer <token>, constant-time compare
+```
+
+```bash
+TOKEN=a-long-random-operator-secret
+
+curl -X POST http://localhost:8080/admin/plans -H "Authorization: Bearer $TOKEN" \
+  -d '{"name":"pro","rateLimit":1000,"windowSec":60,"burst":200}'
+curl http://localhost:8080/admin/tenants -H "Authorization: Bearer $TOKEN"
+curl -X POST http://localhost:8080/admin/tenants/<id>/keys -H "Authorization: Bearer $TOKEN" -d '{"name":"prod"}'
+curl -X DELETE http://localhost:8080/admin/keys/<id> -H "Authorization: Bearer $TOKEN"   # instant, clears the cache too
+curl "http://localhost:8080/admin/usage?tenantId=<id>&sinceHours=24" -H "Authorization: Bearer $TOKEN"
+```
+
+Key creation returns the raw key **once**, the same way `npm run seed` does
+— see [packages/gateway/src/admin/routes.ts](packages/gateway/src/admin/routes.ts)
+for the full route list. Listing keys never returns the raw key or its
+hash, only the display `prefix` and metadata.
+
+### Observability
+
+`GET /metrics` — Prometheus text format, via `prom-client`. Counters
+(`apigate_requests_total`, `..._ratelimit_decisions_total`,
+`..._cache_total`, `..._upstream_errors_total`) and the request-duration
+histogram are recorded as requests happen; the two gauges
+(`apigate_circuit_state`, `apigate_upstream_healthy`) are computed fresh
+from each route's balancer at scrape time rather than pushed — the correct
+direction for state Prometheus is already polling for. Full metric/label
+reference is in [packages/gateway/src/observability/metrics.ts](packages/gateway/src/observability/metrics.ts);
+[grafana-dashboard.json](grafana-dashboard.json) has a starting dashboard
+for all of them (request rate, 429 rate, p50/p95/p99 latency, rate-limit
+decisions, cache hit ratio, upstream errors, breaker state, target health,
+Redis op latency) — not rendered against a live Grafana in this
+environment, so treat the panel JSON as a solid starting point to verify on
+import, not as pixel-proven.
+
+**Config hot-reload** — SIGHUP always tries a reload; set `server.watch:
+true` to also reload on every write to the config file. Either way, only
+`routes` is actually swappable at runtime: `server`, `redis`, `db`, and
+`admin` are fixed for the process's lifetime (Fastify's own listener,
+connections, and route tree can't be rebuilt without a restart), so a
+reload that touches any of those is rejected — the old config keeps running
+and the rejection is logged, never a crash. A syntactically-broken write
+(most editors don't write files atomically, so `fs.watch` can catch a file
+mid-write) fails the same safe way.
 
 ```
 X-Request-Id: <uuid>          # generated if the client didn't send one, always echoed back
@@ -345,9 +403,9 @@ npm run typecheck   # tsc --build, strict
 npm run test         # vitest
 ```
 
-The Redis- and Postgres-backed tests are real integration tests (no mocking —
-see PLAN's testing philosophy): the Postgres ones create and drop their own
-throwaway database per run. Both skip themselves if `REDIS_URL` (default
+The Redis- and Postgres-backed tests are real integration tests, not
+mocks — the Postgres ones create and drop their own throwaway database per
+run. Both skip themselves if `REDIS_URL` (default
 `redis://localhost:6379`) / `POSTGRES_URL` (default
 `postgres://postgres:postgres@localhost:5432/postgres`) aren't reachable, so
 `npm test` still works without Docker. Point them at real instances to run
@@ -400,7 +458,13 @@ of them come online.
       `X-Cache: HIT`/`MISS`; request-side header transform
       (`setHeaders`/`removeHeaders`). See `packages/core/test/cache` and
       `packages/gateway/test/cache.test.ts`.
-- [ ] **Admin API + observability** — tenant/key management, Prometheus
-      metrics
+- [x] **Admin API + observability** — `/admin/*` CRUD for plans/tenants/keys
+      plus a usage-summary endpoint, protected by its own operator token
+      (separate from tenant auth); Prometheus `/metrics` (requests, latency,
+      rate-limit decisions, cache hits, upstream errors, breaker/target
+      state), plus a starting [Grafana dashboard](grafana-dashboard.json);
+      config hot-reload (route table only — see § Observability) via SIGHUP
+      or file watch. See `packages/gateway/test/adminAuth.test.ts`,
+      `packages/gateway/test/metrics.test.ts`, `packages/gateway/test/watch.test.ts`.
 - [ ] **Express adapter + standalone examples** — proof that `core` really is
       framework-agnostic

@@ -4,6 +4,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { DbPool } from '../db/client.js';
 import { findActiveApiKeyWithPlan, touchApiKeyLastUsed } from '../db/repositories/apiKeys.js';
 import type { RouteConfig } from '../config/schema.js';
+import { extractBearerToken } from '../http/bearerToken.js';
 
 export interface TenantPlan {
   readonly limit: number;
@@ -132,12 +133,6 @@ async function lookupApiKey(
   if (record) void touchApiKeyLastUsed(db, record.id);
 
   return record;
-}
-
-function extractBearerToken(header: string | undefined): string | undefined {
-  if (!header) return undefined;
-  const [scheme, token] = header.split(' ');
-  return scheme?.toLowerCase() === 'bearer' && token ? token : undefined;
 }
 
 async function sendUnauthorized(reply: FastifyReply, request: FastifyRequest, message: string): Promise<void> {

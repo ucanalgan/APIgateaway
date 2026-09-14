@@ -90,6 +90,8 @@ const serverSchema = z.object({
   maxBodyBytes: z.number().int().positive().default(1_048_576),
   maxHeaderCount: z.number().int().positive().default(100),
   requestTimeoutMs: z.number().int().positive().default(30000),
+  /** Config dosyası değişince otomatik hot-reload dener. SIGHUP her zaman dener, bundan bağımsız. */
+  watch: z.boolean().default(false),
 });
 
 const redisSchema = z.object({
@@ -101,6 +103,11 @@ const dbSchema = z.object({
   url: z.string().min(1),
 });
 
+const adminSchema = z.object({
+  /** `/admin/*` için tek operatör secret'ı — `Authorization: Bearer <token>`, sabit zamanlı karşılaştırma. */
+  token: z.string().min(1),
+});
+
 export const gatewayConfigSchema = z.object({
   server: serverSchema.default({
     port: 8080,
@@ -108,9 +115,11 @@ export const gatewayConfigSchema = z.object({
     maxBodyBytes: 1_048_576,
     maxHeaderCount: 100,
     requestTimeoutMs: 30000,
+    watch: false,
   }),
   redis: redisSchema.optional(),
   db: dbSchema.optional(),
+  admin: adminSchema.optional(),
   routes: z.array(routeSchema).default([]),
 });
 

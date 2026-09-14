@@ -19,6 +19,11 @@ server:
 # db:
 #   url: postgres://apigate:apigate@localhost:5432/apigate
 
+# Unlocks /admin/* (needs `db:` above too — see README § Admin API). Change
+# the token before using this for anything beyond your own machine.
+# admin:
+#   token: change-me
+
 routes:
   - id: echo-upstream
     match:

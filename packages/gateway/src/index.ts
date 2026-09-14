@@ -19,7 +19,7 @@ async function shutdown(server: FastifyInstance, signal: string): Promise<void> 
 }
 
 async function main(): Promise<void> {
-  const server = await buildServer(config);
+  const server = await buildServer(config, configPath);
 
   process.on('SIGTERM', () => void shutdown(server, 'SIGTERM'));
   process.on('SIGINT', () => void shutdown(server, 'SIGINT'));
