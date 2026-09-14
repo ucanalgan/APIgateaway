@@ -1,5 +1,8 @@
 # APIGate
 
+[![CI](https://github.com/ucanalgan/apigate/actions/workflows/ci.yml/badge.svg)](https://github.com/ucanalgan/apigate/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-48%25-orange)](#coverage)
+
 A framework-agnostic API Gateway and rate limiter, built as a learning project and
 as a reusable building block.
 
@@ -444,15 +447,64 @@ docker run -d --rm -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16-alpine
 REDIS_URL=redis://localhost:6379 POSTGRES_URL=postgres://postgres:postgres@localhost:5432/postgres npm run test
 ```
 
+### Coverage
+
+```bash
+npm run coverage   # vitest run --coverage (needs Redis/Postgres reachable, same as above)
+```
+
+The 48% badge is `v8`-measured statement coverage from `vitest`, and it's
+uneven on purpose rather than evenly thin: `packages/core` — the
+framework-agnostic algorithms, auth, breaker, and cache logic — sits near
+100%, since that's all pure functions that are cheap to unit test directly
+(see [`packages/core/README.md`](packages/core/README.md)). The gateway's
+HTTP-layer glue (`server.ts`, `proxy/*`, `admin/routes.ts`,
+`ratelimit/index.ts`, `auth/index.ts`) shows 0% in the `vitest` report —
+those paths were verified with real running instances and `curl` during
+development (every § above documents the exact commands) rather than with
+`app.inject()`-style integration tests, so `vitest` never executes them.
+That's a real gap in the automated suite, not a hidden one: a regression in
+the proxy/admin/ratelimit request path would currently only be caught by
+manual testing, not by `npm test`.
+
 ## Benchmarking
 
 `bench/baseline.js` is a [k6](https://k6.io) script for measuring the
-gateway's proxy overhead:
+gateway's proxy overhead — 20 constant VUs against `/health` for 30s, direct
+vs. through the gateway's `bench` route (plain passthrough, no rate
+limit/cache/auth, so it isolates proxy overhead instead of measuring the
+demo routes' deliberately-low rate limits):
 
 ```bash
 k6 run -e BASE_URL=http://localhost:4000       bench/baseline.js   # direct upstream
-k6 run -e BASE_URL=http://localhost:8080/echo   bench/baseline.js   # through the gateway
+k6 run -e BASE_URL=http://localhost:8080/bench  bench/baseline.js   # through the gateway (proxy only)
 ```
 
-Compare the two runs' RPS/p50/p99 to see the added cost of each layer as more
-of them come online.
+Or, without installing k6 locally, run it against the `docker-compose.yml`
+stack via the official image:
+
+```bash
+docker compose up -d
+docker run --rm --network apigate_default -v "$PWD/bench:/bench" \
+  -e BASE_URL=http://upstream:4000       grafana/k6 run /bench/baseline.js
+docker run --rm --network apigate_default -v "$PWD/bench:/bench" \
+  -e BASE_URL=http://gateway:8080/bench  grafana/k6 run /bench/baseline.js
+```
+
+Real numbers from that setup (Docker Desktop on Windows, gateway and
+upstream both containerized on the same machine as the k6 load generator —
+treat the absolute numbers as machine-specific, the *relative* overhead as
+the interesting part):
+
+| | RPS | avg | p50 | p90 | p95 | p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Direct upstream | ~20,100 | 0.94 ms | 0.77 ms | 1.55 ms | 1.93 ms | 2.78 ms |
+| Through gateway | ~3,670 | 5.38 ms | 4.72 ms | 7.05 ms | 8.78 ms | 14.2 ms |
+
+The gateway adds roughly 4ms of p50 latency and caps throughput well below
+the bare upstream on this single-process, single-machine setup — expected
+for an extra network hop plus route matching, header rewriting, and undici's
+own connection handling on top of Node's `http` server. `http_req_failed`
+was `0.00%` on both runs (no dropped requests, just added latency). Re-run
+the two commands above whenever you change proxy-path code to see whether
+the delta moved.

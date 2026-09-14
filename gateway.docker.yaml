@@ -22,6 +22,20 @@ admin:
   token: apigate-admin-demo-token
 
 routes:
+  # Plain passthrough, no rate limit/cache/auth — isolates pure proxy
+  # overhead for the benchmark table in README § Benchmarking. The other
+  # routes below all carry a low demo rate limit, which would dominate a
+  # load-test result instead of measuring the proxy itself.
+  - id: bench
+    match:
+      path: /bench/*
+    rewrite:
+      stripPrefix: /bench
+    upstream:
+      targets:
+        - http://upstream:4000
+      timeoutMs: 5000
+
   # Two targets + health check + breaker + retry — stop one
   # (`docker compose stop upstream2`) and traffic keeps flowing through the
   # other with no failed requests. See README § Resilience.

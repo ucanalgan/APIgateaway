@@ -2,10 +2,10 @@
 //
 // Run twice with different BASE_URL values and compare the summaries to see
 // how much latency/throughput the gateway adds over hitting the upstream
-// directly (see PLAN.md §13 benchmark table):
+// directly (see README § Benchmarking for the results table):
 //
 //   k6 run -e BASE_URL=http://localhost:4000        bench/baseline.js   # direct upstream
-//   k6 run -e BASE_URL=http://localhost:8080/echo    bench/baseline.js   # through the gateway (proxy only)
+//   k6 run -e BASE_URL=http://localhost:8080/bench   bench/baseline.js   # through the gateway (proxy only, no rate limit)
 import http from 'k6/http';
 import { check } from 'k6';
 
@@ -22,6 +22,7 @@ export const options = {
   thresholds: {
     http_req_failed: ['rate<0.01'],
   },
+  summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
 };
 
 export default function () {

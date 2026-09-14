@@ -30,7 +30,8 @@
   "files": ["dist", "src"],
   "scripts": {
     "build": "tsc --build && node scripts/copy-lua.mjs",
-    "clean": "tsc --build --clean"
+    "clean": "tsc --build --clean",
+    "compare-algorithms": "tsx scripts/compare-algorithms.ts"
   },
   "dependencies": {
     "jose": "^6.2.12"

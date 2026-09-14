@@ -146,3 +146,57 @@ shared/proxy cache has to follow. It doesn't know about `Set-Cookie` or
 multi-tenancy — those are call-site concerns (see
 [packages/gateway/src/cache](../gateway/src/cache) for how the actual
 gateway handles both).
+
+## Algorithm comparison
+
+The five algorithms all satisfy the same `Algorithm<TState>` signature
+(state in, decision out — see
+[`algorithms/types.ts`](src/ratelimit/algorithms/types.ts)), so they're
+interchangeable behind `createMemoryStore`/`createRedisStore`. They are not
+equivalent in behavior, though. [`scripts/compare-algorithms.ts`](scripts/compare-algorithms.ts)
+runs all five against the same four traffic patterns with simulated (not
+wall-clock) time, so it finishes instantly and is fully reproducible:
+
+```bash
+npm run compare-algorithms -w packages/core
+```
+
+Results for a `{ limit: 10, windowMs: 1000, burst: 10 }` policy:
+
+| Scenario | fixedWindow | tokenBucket | leakyBucket | slidingWindowLog | slidingWindowCounter |
+| --- | --- | --- | --- | --- | --- |
+| 30 requests at the same instant | 10 allowed | 10 allowed | 10 allowed | 10 allowed | 10 allowed |
+| 10 reqs right before a window boundary + 10 right after | **20 allowed** | 10 allowed | 10 allowed | 10 allowed | 10 allowed |
+| Exactly 10 req/s for 5s (50 requests) | 50 allowed | 50 allowed | 50 allowed | 50 allowed | 46 allowed |
+| 12.5 req/s for ~5s, 25% over limit (63 requests) | 50 allowed | 59 allowed | 59 allowed | 50 allowed | 46 allowed |
+
+What that shows, concretely:
+
+- **`fixedWindow`** is the cheapest (one counter) but lets exactly double
+  the limit through across a window boundary — row 2 shows it allowing all
+  20 requests instead of capping at 10. Fine for coarse, cheap protection;
+  wrong if the limit is meant to be a hard ceiling.
+- **`tokenBucket`** and **`leakyBucket`** behave identically at these
+  settings — burst capacity (`policy.burst`, defaulting to `limit`) absorbs
+  the initial excess in row 4 (59/63 allowed) and then throttles to the
+  configured rate. `tokenBucket` allows the burst to be spent immediately;
+  `leakyBucket` additionally smooths the *output* to a constant rate
+  (see `leakyBucket.ts` — it tracks a queue level, not just a token count).
+  Best default for client-facing APIs where short bursts are normal traffic.
+- **`slidingWindowLog`** is exact — no boundary flaw (row 2: 10/10) and no
+  approximation error under sustained overload (row 4: 50/63, identical to
+  the true rate-limited count) — at the cost of storing one timestamp per
+  request in the window (`SlidingWindowLogState.entries`, unbounded by
+  `windowMs / minInterval`). Fine for a low window/limit; expensive at high
+  volume.
+- **`slidingWindowCounter`** approximates the log with O(1) state (a
+  weighted average of the previous and current fixed window) and is the
+  only algorithm that's *stricter* than the true rate even under nominal
+  load — row 3 shows it rejecting 4 of 50 requests sent at exactly the
+  configured rate. That's the weighting formula being conservative right at
+  a window boundary, not a bug; it trades a small amount of throughput for
+  O(1) memory instead of `slidingWindowLog`'s O(n).
+
+None of this is which algorithm is "best" — it's what each one gives up to
+get its performance characteristics, which is the actual decision to make
+per route.
