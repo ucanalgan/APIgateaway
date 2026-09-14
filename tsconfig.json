@@ -28,6 +28,8 @@
   "files": [],
   "references": [
     { "path": "./packages/core" },
-    { "path": "./packages/gateway" }
+    { "path": "./packages/gateway" },
+    { "path": "./packages/adapters/express" },
+    { "path": "./packages/adapters/fastify" }
   ]
 }

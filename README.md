@@ -58,7 +58,9 @@ apigate/
 │  │     ├─ breaker/         # circuit breaker
 │  │     └─ cache/           # Cache-Control interpretation, Redis/memory stores
 │  │
-│  ├─ adapters/               # core → framework glue (fastify, express)
+│  ├─ adapters/
+│  │  ├─ express/             # @apigate/adapter-express — rate limiter as Express middleware
+│  │  └─ fastify/             # @apigate/adapter-fastify — rate limiter as a Fastify plugin
 │  │
 │  └─ gateway/                # the actual application
 │     ├─ src/
@@ -75,7 +77,10 @@ apigate/
 │     │  └─ observability/    # Prometheus metrics, log redaction
 │     └─ scripts/             # seed.ts, revoke-key.ts — see § Auth
 │
-├─ examples/upstream/         # a bare-bones HTTP server used for local testing
+├─ examples/
+│  ├─ upstream/                       # a bare-bones HTTP server used for local testing
+│  ├─ standalone-express/             # @apigate/core's rate limiter in a bare Express app
+│  └─ standalone-fastify/             # ...and the same, in a bare Fastify app
 ├─ bench/                     # k6 load test scripts
 ├─ docker-compose.yml
 ├─ Dockerfile
@@ -129,6 +134,26 @@ redis/db wired up, and routes demonstrating auth (`/api/*`), resilience
 — rather than the dependency-free root `gateway.yaml`. Try
 `docker compose stop upstream2` and keep curling `/echo/*` — see
 [§ Resilience](#resilience).
+
+### Use `@apigate/core` without the gateway at all
+
+The whole point of the `core`/`gateway` split — proved by two standalone,
+independently-`npm install`able examples, each a bare Express/Fastify app
+with no dependency on `packages/gateway`:
+
+```bash
+cd examples/standalone-express && npm install && npm start   # :3000
+cd examples/standalone-fastify && npm install && npm start   # :3001
+```
+
+Both wire up `@apigate/core`'s rate limiter in about the same handful of
+lines shown in [`packages/core/README.md`](packages/core/README.md) (the
+standalone usage guide for `ratelimit`/`auth`/`breaker`/`cache`, all
+usable without pulling in `packages/gateway` or even Fastify/Express) —
+curl either one 6 times with a limit of 5 and the 6th is a `429`, with
+identical headers and error body on both, proven in
+[`packages/adapters/express/test`](packages/adapters/express/test) and
+[`packages/adapters/fastify/test`](packages/adapters/fastify/test).
 
 ## Configuration
 
@@ -378,6 +403,8 @@ and the rejection is logged, never a crash. A syntactically-broken write
 (most editors don't write files atomically, so `fs.watch` can catch a file
 mid-write) fails the same safe way.
 
+## Response contract
+
 ```
 X-Request-Id: <uuid>          # generated if the client didn't send one, always echoed back
 RateLimit-Limit: 100          # on rate-limited routes only
@@ -466,5 +493,11 @@ of them come online.
       config hot-reload (route table only — see § Observability) via SIGHUP
       or file watch. See `packages/gateway/test/adminAuth.test.ts`,
       `packages/gateway/test/metrics.test.ts`, `packages/gateway/test/watch.test.ts`.
-- [ ] **Express adapter + standalone examples** — proof that `core` really is
-      framework-agnostic
+- [x] **Express/Fastify adapters + standalone examples** — `@apigate/adapter-express`
+      and `@apigate/adapter-fastify` wrap `core/ratelimit` as one-line
+      middleware/a plugin; `examples/standalone-*` are independently
+      `npm install`able apps with zero dependency on `packages/gateway`;
+      parity tests assert both adapters produce identical behavior for the
+      same scenario. `packages/core/README.md` is the standalone usage
+      guide for all four `core` modules. See
+      `packages/adapters/*/test/rateLimiter.test.ts`.

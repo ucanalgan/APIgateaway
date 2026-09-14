@@ -1,0 +1,15 @@
+{
+  "name": "standalone-fastify-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Proves @apigate/core's rate limiter works outside the gateway, in a bare Fastify app",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@apigate/adapter-fastify": "file:../../packages/adapters/fastify",
+    "fastify": "^5.12.0"
+  }
+}

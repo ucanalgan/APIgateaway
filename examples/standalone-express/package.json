@@ -1,0 +1,15 @@
+{
+  "name": "standalone-express-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Proves @apigate/core's rate limiter works outside the gateway, in a bare Express app",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@apigate/adapter-express": "file:../../packages/adapters/express",
+    "express": "^5.2.1"
+  }
+}
