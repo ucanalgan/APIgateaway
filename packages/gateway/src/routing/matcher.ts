@@ -13,6 +13,16 @@ export function matchRoute(routes: readonly RouteConfig[], input: MatchInput): R
   return routes.find((route) => matchesMethod(route, input.method) && matchesPath(route, input.path));
 }
 
+/**
+ * Method'u yok sayar — CORS preflight (`OPTIONS` + `Access-Control-Request-Method`)
+ * bir route'un `match.methods` kısıtına gerçekte hiç uymaz (tarayıcı gerçek
+ * metotla değil, hep `OPTIONS` ile sorar). Preflight'a doğru route'un
+ * `cors` config'ini bulmak için kullanılır — bkz. server.ts.
+ */
+export function matchRouteByPath(routes: readonly RouteConfig[], path: string): RouteConfig | undefined {
+  return routes.find((route) => matchesPath(route, path));
+}
+
 function matchesMethod(route: RouteConfig, method: string): boolean {
   const methods = route.match.methods;
   return !methods || methods.includes(method as (typeof methods)[number]);

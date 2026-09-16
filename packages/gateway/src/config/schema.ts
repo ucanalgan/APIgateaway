@@ -29,15 +29,40 @@ const authSchema = z.discriminatedUnion('type', [
   }),
 ]);
 
-const rateLimitSchema = z.object({
-  algorithm: z
-    .enum(['tokenBucket', 'slidingWindowLog', 'slidingWindowCounter', 'fixedWindow', 'leakyBucket'])
-    .default('tokenBucket'),
-  keyBy: z.array(z.enum(['tenant', 'ip'])).min(1).default(['ip']),
+const globalRateLimitSchema = z.object({
   limit: z.number().int().positive(),
   windowSec: z.number().int().positive(),
   burst: z.number().int().positive().optional(),
 });
+
+const rateLimitSchema = z
+  .object({
+    algorithm: z
+      .enum(['tokenBucket', 'slidingWindowLog', 'slidingWindowCounter', 'fixedWindow', 'leakyBucket'])
+      .default('tokenBucket'),
+    keyBy: z.array(z.enum(['tenant', 'ip', 'global'])).min(1).default(['ip']),
+    limit: z.number().int().positive(),
+    windowSec: z.number().int().positive(),
+    burst: z.number().int().positive().optional(),
+    /**
+     * `keyBy: [global]` için ayrı policy — route'un toplam upstream
+     * kapasitesini korur, tek bir tenant/IP'nin kotasından bağımsız (bkz.
+     * PLAN.md §5: üç key tipi aynı anda uygulanabilir, herhangi biri
+     * reddederse istek reddedilir). Kasıtlı olarak `limit`/`windowSec`'i
+     * miras almıyor — global kapasite neredeyse her zaman tek bir
+     * çağıranın kotasından farklı bir sayıdır.
+     */
+    global: globalRateLimitSchema.optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.keyBy.includes('global') && !value.global) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'keyBy includes "global" but no "global" policy (limit/windowSec) is configured.',
+        path: ['global'],
+      });
+    }
+  });
 
 const cacheSchema = z.object({
   enabled: z.boolean().default(false),
@@ -52,6 +77,21 @@ const transformSchema = z.object({
       removeHeaders: z.array(z.string()).default([]),
     })
     .optional(),
+});
+
+const corsSchema = z.object({
+  enabled: z.boolean().default(false),
+  /** `'*'` joker; aksi halde `Origin` header'ı listede birebir olmalı. */
+  origins: z.array(z.string().min(1)).min(1).default(['*']),
+  methods: z
+    .array(httpMethodSchema)
+    .min(1)
+    .default(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']),
+  allowedHeaders: z.array(z.string().min(1)).default(['Content-Type', 'Authorization']),
+  exposedHeaders: z.array(z.string().min(1)).default([]),
+  /** `true` ise `Access-Control-Allow-Origin` asla `*` olmaz (spec) — origin birebir yansıtılır. */
+  credentials: z.boolean().default(false),
+  maxAgeSec: z.number().int().nonnegative().default(600),
 });
 
 const retrySchema = z.object({
@@ -79,6 +119,7 @@ const routeSchema = z.object({
   auth: authSchema.default({ type: 'none' }),
   rateLimit: rateLimitSchema.optional(),
   cache: cacheSchema.optional(),
+  cors: corsSchema.optional(),
   transform: transformSchema.optional(),
   retry: retrySchema.optional(),
   circuitBreaker: circuitBreakerSchema.optional(),

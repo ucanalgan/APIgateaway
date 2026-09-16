@@ -39,6 +39,12 @@ routes:
       keyBy: [ip]
       limit: 10
       windowSec: 60
+    # A browser calling this cross-origin needs these — uncomment to try a
+    # preflight: `curl -i -X OPTIONS http://localhost:8080/echo/hello
+    #   -H 'Origin: http://localhost:5500' -H 'Access-Control-Request-Method: GET'`
+    # cors:
+    #   enabled: true
+    #   origins: ['http://localhost:5500']
 
   # Uncomment this alongside `db:` (and `redis:`, for a shared cache) to try
   # API-key auth with tenant/plan-driven rate limits (see README § Auth).
@@ -60,6 +66,16 @@ routes:
   #     healthCheck: { path: /health, intervalMs: 5000 }
   #   retry: { attempts: 2, backoffMs: 100 }
   #   circuitBreaker: { failureThreshold: 3, resetTimeoutMs: 10000 }
+  #   # `global` caps THIS route's total traffic regardless of caller — on
+  #   # top of (not instead of) the per-IP/tenant keys, protecting the two
+  #   # upstreams above from being overwhelmed no matter how many distinct
+  #   # clients are asking. Any of the listed keys rejecting rejects the request.
+  #   rateLimit:
+  #     algorithm: tokenBucket
+  #     keyBy: [ip, global]
+  #     limit: 20
+  #     windowSec: 60
+  #     global: { limit: 200, windowSec: 60 }
 
   # Second GET to the same path comes back with X-Cache: HIT and never
   # touches upstream (see README § Cache). The example fixture doesn't set

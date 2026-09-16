@@ -198,10 +198,25 @@ Every route needs an `id`, a `match.path` (an exact path, or a path ending in
 A route with `rateLimit` gets one of five algorithms (`fixedWindow`,
 `tokenBucket`, `leakyBucket`, `slidingWindowLog`, `slidingWindowCounter`).
 `keyBy` picks which counters apply — `ip` (`ip:<addr>:route:<id>`), `tenant`
-(`tenant:<id>:route:<id>`, needs `auth`), or both at once: every listed key
-is checked independently and the request is rejected if *any* of them is
-over quota. By default each route's counters live in an in-process memory
-store — enough for a single instance, and all `npm run dev` needs.
+(`tenant:<id>:route:<id>`, needs `auth`), `global` (`global:route:<id>`,
+one shared bucket for the route's *total* traffic, independent of who's
+asking), or any combination: every listed key is checked independently and
+the request is rejected if *any* of them is over quota. By default each
+route's counters live in an in-process memory store — enough for a single
+instance, and all `npm run dev` needs.
+
+`global` needs its own `limit`/`windowSec` (and optional `burst`) — it
+protects the upstream's total capacity, which is almost never the same
+number as a single caller's quota:
+
+```yaml
+rateLimit:
+  algorithm: tokenBucket
+  keyBy: [ip, global]
+  limit: 20            # per IP
+  windowSec: 60
+  global: { limit: 200, windowSec: 60 }   # the route as a whole, regardless of caller
+```
 
 Add a top-level `redis` block to share quota across multiple gateway
 instances instead (state moves into Redis, atomic via a Lua script per
@@ -309,6 +324,36 @@ transform:
   request:
     setHeaders: { X-Gateway: apigate }
     removeHeaders: [X-Internal-Token]
+```
+
+### CORS
+
+A route with `cors.enabled` gets both halves of CORS: preflight (`OPTIONS`
+with an `Access-Control-Request-Method` header, which only a browser ever
+sends) is answered directly — `204`, no auth, no rate limit, no upstream
+call, since a preflight is never supposed to reach any of those — and every
+other response to that route (success, cache hit, `401`, `429`, `5xx`, all
+of it) gets `Access-Control-Allow-Origin` added on the way out, because a
+browser needs the header on the *error* too to let JS read the body:
+
+```yaml
+cors:
+  enabled: true
+  origins: ['https://app.example.com']   # or ['*'] for any origin
+  # methods, allowedHeaders, exposedHeaders, credentials, maxAgeSec are all optional
+```
+
+`origins: ['*']` and `credentials: true` never combine — that combination is
+rejected by every browser (a wildcard can't carry credentials), so the
+gateway always echoes back the exact `Origin` instead of `*` whenever
+`credentials` is on, wildcard or not. An origin not on the list gets no
+CORS headers at all: the gateway still answers the request normally (this
+isn't an authorization mechanism, just a browser-enforced same-origin
+policy), the browser is what blocks the script from reading the response.
+
+```bash
+curl -i -X OPTIONS http://localhost:8080/cached/hello \
+  -H 'Origin: http://localhost:5500' -H 'Access-Control-Request-Method: GET'
 ```
 
 ### Resilience

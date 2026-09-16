@@ -5,8 +5,9 @@ import { Redis } from 'ioredis';
 import { decideCacheability } from '@apigate/core/cache';
 import type { GatewayConfig } from './config/schema.js';
 import { watchConfig } from './config/watch.js';
-import { matchRoute } from './routing/matcher.js';
+import { matchRoute, matchRouteByPath } from './routing/matcher.js';
 import { rewritePath } from './routing/rewrite.js';
+import { isOriginAllowed, applyCorsResponseHeaders, applyPreflightHeaders } from './cors/index.js';
 import { UpstreamTimeoutError } from './proxy/forward.js';
 import { createBalancer, type Balancer } from './proxy/balancer.js';
 import { forwardWithRetry, NoHealthyTargetError } from './proxy/retry.js';
@@ -138,6 +139,18 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
   app.addHook('onRequest', enforceHeaderLimit(initialConfig.server.maxHeaderCount));
   app.addHook('onSend', async (request, reply, payload) => {
     reply.header('x-request-id', request.id);
+
+    // Route eşleşip eşleşmediğine (401/429/5xx dahil) bakmaksızın uygulanır
+    // — tarayıcı, CORS header'ı olmayan bir hata gövdesini JS'e hiç
+    // göstermez, o yüzden bu her yanıtta çalışmalı, sadece "başarılı" yolda değil.
+    const origin = request.headers.origin;
+    if (typeof origin === 'string' && request.apigateRouteId) {
+      const route = state.config.routes.find((r) => r.id === request.apigateRouteId);
+      if (route?.cors?.enabled && isOriginAllowed(route.cors, origin)) {
+        applyCorsResponseHeaders(route.cors, origin, reply);
+      }
+    }
+
     return payload;
   });
 
@@ -219,6 +232,29 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
 
   app.all('/*', async (request, reply) => {
     const path = request.url.split('?')[0] ?? '/';
+
+    // CORS preflight: tarayıcı bunu her zaman `OPTIONS` + kendi ürettiği
+    // `Access-Control-Request-Method` header'ıyla gönderir — bir istemci
+    // script'i bu header'ı asla elle set edemez, o yüzden varlığı tek
+    // başına güvenilir bir sinyal. Route'un `match.methods` kısıtı burada
+    // yok sayılır (preflight gerçek metotla değil hep OPTIONS ile gelir) ve
+    // istek auth/rate-limit/proxy'e hiç girmeden burada cevaplanır —
+    // preflight'ın kimlik doğrulaması ya da kotaya sayılması spec'e aykırı.
+    const origin = request.headers.origin;
+    const isPreflight =
+      request.method === 'OPTIONS' &&
+      typeof origin === 'string' &&
+      typeof request.headers['access-control-request-method'] === 'string';
+
+    if (isPreflight) {
+      const corsRoute = matchRouteByPath(state.config.routes, path);
+      if (corsRoute?.cors?.enabled && isOriginAllowed(corsRoute.cors, origin)) {
+        request.apigateRouteId = corsRoute.id;
+        applyPreflightHeaders(corsRoute.cors, origin, reply);
+        return reply.code(204).send();
+      }
+    }
+
     const route = matchRoute(state.config.routes, { method: request.method, path });
 
     if (!route) {

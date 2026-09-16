@@ -64,7 +64,16 @@ export async function enforceRateLimit(
   for (const strategy of config.keyBy) {
     if (strategy === 'ip') {
       checks.push({ key: `ip:${request.ip}:route:${route.id}`, policy: routePolicy });
-    } else if (context.tenantId) {
+    } else if (strategy === 'global') {
+      // Tek tenant/IP'nin kotasından bağımsız, route'un toplam upstream
+      // kapasitesini korur — bkz. schema.ts: `global` policy, `keyBy`
+      // "global" içerdiğinde zorunlu, o yüzden burada her zaman dolu.
+      const g = config.global!;
+      checks.push({
+        key: `global:route:${route.id}`,
+        policy: { limit: g.limit, windowMs: g.windowSec * 1000, ...(g.burst !== undefined ? { burst: g.burst } : {}) },
+      });
+    } else if (strategy === 'tenant' && context.tenantId) {
       const plan = context.tenantPlan;
       checks.push({
         key: `tenant:${context.tenantId}:route:${route.id}`,

@@ -58,11 +58,15 @@ routes:
     circuitBreaker:
       failureThreshold: 3
       resetTimeoutMs: 10000
+    # `global` caps this route's total traffic across both targets above,
+    # regardless of which client is asking — on top of, not instead of, the
+    # per-IP limit. See README § Rate limiting.
     rateLimit:
       algorithm: tokenBucket
-      keyBy: [ip]
+      keyBy: [ip, global]
       limit: 10
       windowSec: 60
+      global: { limit: 30, windowSec: 60 }
 
   # redis/postgres are also published to the host (see docker-compose.yml),
   # so seed from your machine against gateway.yaml with its `redis`/`db`
@@ -87,7 +91,10 @@ routes:
 
   # Second GET to the same path comes back with X-Cache: HIT and never
   # touches upstream (see README § Cache). setHeaders/removeHeaders only run
-  # on a miss — a hit skips the outbound request entirely.
+  # on a miss — a hit skips the outbound request entirely. Also CORS-enabled,
+  # for a browser calling this cross-origin — see README § CORS. Try a
+  # preflight: `curl -i -X OPTIONS http://localhost:8080/cached/hello
+  #   -H 'Origin: http://localhost:5500' -H 'Access-Control-Request-Method: GET'`
   - id: cached-echo
     match:
       path: /cached/*
@@ -104,3 +111,6 @@ routes:
     transform:
       request:
         setHeaders: { X-Gateway: apigate }
+    cors:
+      enabled: true
+      origins: ['*']
