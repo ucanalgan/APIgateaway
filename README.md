@@ -1,7 +1,7 @@
 # APIGate
 
 [![CI](https://github.com/ucanalgan/apigate/actions/workflows/ci.yml/badge.svg)](https://github.com/ucanalgan/apigate/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-48%25-orange)](#coverage)
+[![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](#coverage)
 
 A framework-agnostic API Gateway and rate limiter, built as a learning project and
 as a reusable building block.
@@ -192,6 +192,15 @@ routes:
 
 Every route needs an `id`, a `match.path` (an exact path, or a path ending in
 `/*` for a prefix match), and at least one `upstream.targets` entry.
+
+The `server` limits are enforced before a request reaches any route:
+`maxHeaderCount` (→ `431`) and `maxBodyBytes` (→ `413`). Bodies are proxied as
+raw streams rather than parsed, so the body limit is checked two ways: a
+declared `Content-Length` over the limit is refused before a single byte is
+read, and a chunked body (no `Content-Length`) is counted as it streams and
+cut off the moment it crosses the limit — the upstream never receives a
+complete request. An oversized body is the client's fault, so it never counts
+against an upstream's circuit breaker.
 
 ### Rate limiting
 
@@ -498,19 +507,27 @@ REDIS_URL=redis://localhost:6379 POSTGRES_URL=postgres://postgres:postgres@local
 npm run coverage   # vitest run --coverage (needs Redis/Postgres reachable, same as above)
 ```
 
-The 48% badge is `v8`-measured statement coverage from `vitest`, and it's
-uneven on purpose rather than evenly thin: `packages/core` — the
-framework-agnostic algorithms, auth, breaker, and cache logic — sits near
-100%, since that's all pure functions that are cheap to unit test directly
-(see [`packages/core/README.md`](packages/core/README.md)). The gateway's
-HTTP-layer glue (`server.ts`, `proxy/*`, `admin/routes.ts`,
-`ratelimit/index.ts`, `auth/index.ts`) shows 0% in the `vitest` report —
-those paths were verified with real running instances and `curl` during
-development (every § above documents the exact commands) rather than with
-`app.inject()`-style integration tests, so `vitest` never executes them.
-That's a real gap in the automated suite, not a hidden one: a regression in
-the proxy/admin/ratelimit request path would currently only be caught by
-manual testing, not by `npm test`.
+The badge is `v8`-measured statement coverage from the full suite run
+against real Redis and Postgres: **95% statements, 92% branches, 94%
+functions** (216 tests). It's a hand-updated number — re-run the command
+above and edit the badge at the top of this file when it moves.
+
+Two layers of tests produce it. `packages/core` — the framework-agnostic
+algorithms, auth, breaker, and cache logic — is unit-tested directly, since
+it's all functions that take plain data. The gateway is tested *through its
+real request pipeline*: `buildServer()` + `app.inject()` (or a real
+listening socket where the test needs one) in front of real HTTP upstreams
+on ephemeral ports, a real JWKS endpoint with real RS256 signatures, a
+throwaway Postgres database per file, and real Redis — including two
+gateway instances sharing one Redis quota, and a deliberately-dead Redis
+port for the `failOpen`/fail-closed and cache-fallback paths. Nothing in
+the suite is mocked. See `packages/gateway/test/*Pipeline*.test.ts`,
+`proxy.test.ts`, `apiKeyAuth.test.ts`, `adminApi.test.ts`.
+
+The one file at 0% is `packages/gateway/src/index.ts` — the process
+entrypoint (config load, signal handlers, `listen`), which `vitest` can't
+meaningfully exercise without spawning the whole process; `docker compose up`
+(§ Getting started) is what covers it.
 
 ## Benchmarking
 

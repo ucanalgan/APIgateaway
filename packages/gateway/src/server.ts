@@ -13,7 +13,7 @@ import { createBalancer, type Balancer } from './proxy/balancer.js';
 import { forwardWithRetry, NoHealthyTargetError } from './proxy/retry.js';
 import { applyRequestTransform } from './proxy/transform.js';
 import { bufferStream } from './proxy/bufferStream.js';
-import { enforceHeaderLimit } from './security/limits.js';
+import { BodyTooLargeError, enforceBodyLimit, enforceHeaderLimit, limitBodySize } from './security/limits.js';
 import { createRateLimitStores, enforceRateLimit } from './ratelimit/index.js';
 import { authenticateRequest } from './auth/index.js';
 import { createCacheStores, buildCacheKey, stripUncacheableHeaders } from './cache/index.js';
@@ -54,6 +54,36 @@ function assertHotReloadable(oldConfig: GatewayConfig, newConfig: GatewayConfig)
   const missingDb = apiKeyRoutesNeedingDb(newConfig);
   if (missingDb.length > 0 && !newConfig.db) {
     throw new Error(`Route(s) ${missingDb.join(', ')} use auth.type "apiKey" but no top-level "db" config is set.`);
+  }
+}
+
+/**
+ * `enableOfflineQueue` kapalıyken bağlantı kurulmadan gönderilen komutlar
+ * hemen reddedilir — boot'tan hemen sonraki ilk istekler Redis "down" sayılıp
+ * `failOpen` ile sessizce limitsiz geçerdi. Bağlantı hazır olana ya da ilk
+ * deneme başarısız olana kadar beklenir; Redis gerçekten down ise açılış
+ * bloklanmaz (o zaman `failOpen` politikası zaten devrede olmalı).
+ */
+function waitForRedis(client: Redis): Promise<void> {
+  if (client.status === 'ready') return Promise.resolve();
+
+  return new Promise((resolve) => {
+    const finish = (): void => {
+      client.off('ready', finish);
+      client.off('close', finish);
+      resolve();
+    };
+    client.once('ready', finish);
+    client.once('close', finish);
+  });
+}
+
+/** Redis down iken `quit()` reddedilir (offline queue kapalı) — graceful shutdown'ı bozmasın. */
+async function closeRedis(client: Redis): Promise<void> {
+  try {
+    await client.quit();
+  } catch {
+    client.disconnect();
   }
 }
 
@@ -125,6 +155,7 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
   redisClient?.on('error', (err: unknown) => {
     app.log.warn({ err }, 'redis connection error');
   });
+  if (redisClient) await waitForRedis(redisClient);
 
   app.decorateRequest('apigateTenantId', undefined);
   app.decorateRequest('apigateRouteId', undefined);
@@ -132,11 +163,14 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
   // Gateway rastgele içerik tipleri proxy'ler; body'yi parse/buffer etmek
   // yerine olduğu gibi (stream) upstream'e aktarmalıyız.
   app.removeAllContentTypeParsers();
+  // Fastify'ın `bodyLimit`'i sadece kendi okuduğu gövdelere uygulanır; stream
+  // olarak geçirilenlere değil — limit bu yüzden burada, ayrıca uygulanır.
   app.addContentTypeParser('*', (_request, payload, done) => {
-    done(null, payload);
+    done(null, limitBodySize(payload, initialConfig.server.maxBodyBytes));
   });
 
   app.addHook('onRequest', enforceHeaderLimit(initialConfig.server.maxHeaderCount));
+  app.addHook('onRequest', enforceBodyLimit(initialConfig.server.maxBodyBytes));
   app.addHook('onSend', async (request, reply, payload) => {
     reply.header('x-request-id', request.id);
 
@@ -206,7 +240,7 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
     for (const balancer of state.balancers.values()) balancer.close();
     await usageBuffer?.close();
     await dbPool?.end();
-    if (redisClient) await redisClient.quit();
+    if (redisClient) await closeRedis(redisClient);
   });
 
   app.get('/health', async (request) => {
@@ -368,6 +402,14 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
 
       return reply.send(upstream.body);
     } catch (err) {
+      if (err instanceof BodyTooLargeError) {
+        return reply.code(413).send({
+          error: 'payload_too_large',
+          message: err.message,
+          requestId: request.id,
+        });
+      }
+
       if (err instanceof UpstreamTimeoutError) {
         metrics.recordUpstreamError(route.id, 'timeout');
         return reply.code(504).send({

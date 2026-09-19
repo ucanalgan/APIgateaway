@@ -44,9 +44,26 @@ export async function registerAdminRoutes(app: FastifyInstance, token: string, d
       admin.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
         try {
           done(null, body === '' ? {} : JSON.parse(body as string));
-        } catch (err) {
-          done(err as Error, undefined);
+        } catch {
+          done(Object.assign(new Error('Request body is not valid JSON.'), { statusCode: 400 }), undefined);
         }
+      });
+
+      // Tüm hata gövdeleri aynı şekilde (error/message/requestId) — ve beklenmedik
+      // hatalarda (örn. bir DB hatası) ham mesaj istemciye sızmasın.
+      admin.setErrorHandler((err: Error & { statusCode?: number }, request, reply) => {
+        const status = err.statusCode ?? 500;
+
+        if (status >= 500) {
+          request.log.error({ err }, 'admin request failed');
+          return reply.code(500).send({
+            error: 'internal_error',
+            message: 'Internal server error.',
+            requestId: request.id,
+          });
+        }
+
+        return reply.code(status).send({ error: 'invalid_request', message: err.message, requestId: request.id });
       });
 
       admin.addHook('onRequest', requireAdminToken(token));

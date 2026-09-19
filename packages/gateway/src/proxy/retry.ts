@@ -2,6 +2,7 @@ import type { Readable } from 'node:stream';
 import { forwardRequest, type ForwardOptions, type ForwardResult } from './forward.js';
 import type { Balancer } from './balancer.js';
 import { bufferStream } from './bufferStream.js';
+import { BodyTooLargeError } from '../security/limits.js';
 import type { RouteConfig } from '../config/schema.js';
 
 const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE']);
@@ -58,6 +59,10 @@ export async function forwardWithRetry(
 
       return result;
     } catch (err) {
+      // Müşterinin gövdesi çok büyük — upstream'in suçu değil: ne breaker'a
+      // hata yazılır ne de tekrar denenir (gövde zaten bir kez tüketildi).
+      if (err instanceof BodyTooLargeError) throw err;
+
       balancer.reportFailure(target);
       lastError = err;
 
