@@ -77,11 +77,14 @@ apigate/
 │     │  ├─ usage/            # buffered usage_records writer
 │     │  ├─ db/                # Postgres client, migrations, repositories
 │     │  ├─ admin/            # /admin/* — tenant/plan/key CRUD, its own auth
+│     │  ├─ cors/             # CORS preflight + response headers
+│     │  ├─ websocket/        # upgrade handling, upstream↔client bridge, connection registry
 │     │  └─ observability/    # Prometheus metrics, log redaction
 │     └─ scripts/             # seed.ts, revoke-key.ts — see § Auth
 │
 ├─ examples/
 │  ├─ upstream/                       # a bare-bones HTTP server used for local testing
+│  ├─ ws-echo/                        # a WebSocket echo server, the upstream for § WebSocket
 │  ├─ standalone-express/             # @apigate/core's rate limiter in a bare Express app
 │  └─ standalone-fastify/             # ...and the same, in a bare Fastify app
 ├─ bench/                     # k6 load test scripts
@@ -130,11 +133,12 @@ curl http://localhost:8080/metrics       # Prometheus text format, always on
 docker compose up --build
 ```
 
-This starts the gateway, Redis, PostgreSQL, and **two** example-upstream
-instances together, using [gateway.docker.yaml](gateway.docker.yaml) —
-redis/db wired up, and routes demonstrating auth (`/api/*`), resilience
-(`/echo/*`, two targets + health check + breaker), and caching (`/cached/*`)
-— rather than the dependency-free root `gateway.yaml`. Try
+This starts the gateway, Redis, PostgreSQL, **two** example-upstream
+instances and a WebSocket echo server together, using
+[gateway.docker.yaml](gateway.docker.yaml) — redis/db wired up, and routes
+demonstrating auth (`/api/*`), resilience (`/echo/*`, two targets + health
+check + breaker), caching (`/cached/*`), host routing and WebSocket
+(`/ws/*`, `/wsp/*`) — rather than the dependency-free root `gateway.yaml`. Try
 `docker compose stop upstream2` and keep curling `/echo/*` — see
 [§ Resilience](#resilience).
 
@@ -201,6 +205,12 @@ read, and a chunked body (no `Content-Length`) is counted as it streams and
 cut off the moment it crosses the limit — the upstream never receives a
 complete request. An oversized body is the client's fault, so it never counts
 against an upstream's circuit breaker.
+
+The upstream URL is always the **target's origin plus the request path**, so a
+crafted request line like `GET //internal-host/x` is forwarded as an odd *path*
+to the configured upstream — it can never redirect the request to another
+host (a classic SSRF: `new URL('//host/x', target)` silently swaps the host).
+The same holds after `stripPrefix` and for WebSocket handshakes.
 
 ### Host-based routing
 
@@ -412,6 +422,92 @@ curl -i -X OPTIONS http://localhost:8080/cached/hello \
   -H 'Origin: http://localhost:5500' -H 'Access-Control-Request-Method: GET'
 ```
 
+### WebSocket
+
+A WebSocket starts life as an ordinary HTTP request (`Upgrade: websocket`),
+then the same TCP connection turns into a long-lived two-way message channel.
+A route opts in with `websocket.enabled`:
+
+```yaml
+- id: chat
+  match: { path: /ws/* }
+  rewrite: { stripPrefix: /ws }
+  upstream: { targets: [http://chat-service:4100] }   # http:// → ws://, https:// → wss://
+  rateLimit: { algorithm: slidingWindowLog, keyBy: [ip], limit: 30, windowSec: 60 }   # the handshake
+  websocket:
+    enabled: true
+    maxConnections: 100                # per route, per gateway instance
+    messageRateLimit: { algorithm: tokenBucket, limit: 20, windowSec: 10 }   # per connection
+```
+
+**How it works.** The gateway *terminates* the connection: it holds one
+WebSocket to the client and a separate one to the upstream, and relays
+messages between them (text stays text, binary stays binary, order is
+preserved). The handshake goes through the same pipeline as any request —
+route and host matching, auth, the route's `rateLimit`, `transform`, the
+balancer and breaker — and it connects to the upstream **first**: only if the
+upstream accepts does the client get its `101`. So an upstream that answers
+`401` shows up as a real `401` (with its body) instead of a connection that
+opens and immediately dies, and the sub-protocol the client ends up with is
+the one the *upstream* picked. Anything that isn't a WebSocket upgrade, or a
+route without `websocket.enabled`, gets a `400`.
+
+**Auth.** `Authorization: Bearer <token>` on the handshake works as on any
+route. A browser's `new WebSocket()` can't set headers, so `queryToken: true`
+also accepts `?access_token=<token>`. It's off by default: URLs travel through
+more logs than headers do. With it on, the gateway masks the token in its own
+logs (`access_token=[redacted]`) and never forwards it in the URL — the
+upstream receives it as an `Authorization` header instead. Proxies or CDNs *in
+front of* the gateway can still log the URL, so prefer short-lived tokens.
+Set `origins: [https://app.example.com]` to refuse browsers from other
+origins with a `403` (a client that sends no `Origin`, i.e. not a browser, is
+not affected).
+
+**Protecting the gateway and the upstream** — each of these closes the
+connection with a standard code rather than degrading silently:
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `rateLimit` (route) | — | limits *handshakes*, per IP / tenant / global, exactly as for HTTP |
+| `maxConnections` | `1000` | concurrent connections on this route; the next handshake gets `503` |
+| `messageRateLimit` | off | messages per connection, client → upstream; over it closes with `1008` |
+| `maxMessageBytes` | `1 MiB` | one message, either direction; over it closes with `1009` |
+| `maxBufferedBytes` | `4 MiB` | queued for a peer that isn't reading; over it closes with `1013` |
+| `pingIntervalMs` | `30000` | pings both sides; a peer that doesn't answer the next round is cut (`0` = off) |
+| `idleTimeoutMs` | `0` | no message in either direction for this long closes with `1001` (`0` = off) |
+
+Close codes and reasons a peer sends are passed through to the other side, so
+an application-level `4001 "session expired"` reaches the client intact.
+On shutdown every open connection is closed with `1001 "Going Away"` and the
+process exits in about a second instead of waiting for clients to leave.
+
+Things worth knowing: per-message compression (`permessage-deflate`) is off on
+both legs; a failed handshake is not retried; `maxConnections` and
+`messageRateLimit` are per gateway instance and per connection (kept in
+memory, not Redis — a Redis round trip per message would cost more than the
+limit is worth); and a route serves plain HTTP and WebSocket side by side, so
+one path can be both. Try it with `docker compose up` and
+`npx wscat -c ws://localhost:8080/ws/room` (`/wsp/*` is the same behind API-key
+auth — see [gateway.docker.yaml](gateway.docker.yaml)).
+
+### Streaming responses (SSE)
+
+A `text/event-stream` response is just an HTTP response that stays open, and
+it streams through the gateway as it arrives. What can bite is the upstream
+timeout: `upstream.timeoutMs` also bounds the silence *between* chunks, so a
+stream that goes quiet for longer than that (5s by default) is cut mid-way.
+`bodyTimeoutMs` controls that gap on its own; `0` removes the limit:
+
+```yaml
+upstream:
+  targets: [http://events-service:3000]
+  timeoutMs: 5000        # still the limit for the response headers to arrive
+  bodyTimeoutMs: 0       # ...but a stream may stay quiet as long as it likes
+```
+
+If the client hangs up, the gateway stops reading from the upstream and
+releases that connection.
+
 ### Resilience
 
 With more than one `upstream.targets` entry, requests are spread round-robin
@@ -496,9 +592,10 @@ hash, only the display `prefix` and metadata.
 
 `GET /metrics` — Prometheus text format, via `prom-client`. Counters
 (`apigate_requests_total`, `..._ratelimit_decisions_total`,
-`..._cache_total`, `..._upstream_errors_total`) and the request-duration
-histogram are recorded as requests happen; the two gauges
-(`apigate_circuit_state`, `apigate_upstream_healthy`) are computed fresh
+`..._cache_total`, `..._upstream_errors_total`), the request-duration
+histogram and the WebSocket series (`apigate_websocket_connections`,
+`..._messages_total`, `..._closed_total`) are recorded as things happen; the
+two gauges (`apigate_circuit_state`, `apigate_upstream_healthy`) are computed fresh
 from each route's balancer at scrape time rather than pushed — the correct
 direction for state Prometheus is already polling for. Full metric/label
 reference is in [packages/gateway/src/observability/metrics.ts](packages/gateway/src/observability/metrics.ts);
@@ -567,8 +664,8 @@ npm run coverage   # vitest run --coverage (needs Redis/Postgres reachable, same
 ```
 
 The badge is `v8`-measured statement coverage from the full suite run
-against real Redis and Postgres: **96% statements, 93% branches, 95%
-functions** (270 tests). The badge is hand-updated — re-run the command
+against real Redis and Postgres: **96% statements, 92% branches, 95%
+functions** (358 tests). The badge is hand-updated — re-run the command
 above and edit it when the number moves.
 
 CI runs `npm run coverage` and enforces a floor (90% statements/lines/

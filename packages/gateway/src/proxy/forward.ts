@@ -1,6 +1,7 @@
 import type { IncomingHttpHeaders } from 'node:http';
 import type { Readable } from 'node:stream';
 import { errors as undiciErrors, request as undiciRequest, type Dispatcher } from 'undici';
+import { joinUpstreamUrl } from './upstreamUrl.js';
 
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
@@ -24,6 +25,8 @@ export interface ForwardOptions {
    */
   readonly body: Readable | Buffer | undefined;
   readonly timeoutMs: number;
+  /** İki gövde parçası arası azami süre; verilmezse `timeoutMs`, `0` = sınırsız (SSE). */
+  readonly bodyTimeoutMs?: number;
   readonly clientIp: string;
   readonly requestId: string;
 }
@@ -35,7 +38,7 @@ export interface ForwardResult {
 }
 
 export async function forwardRequest(target: string, path: string, opts: ForwardOptions): Promise<ForwardResult> {
-  const url = new URL(path, target);
+  const url = joinUpstreamUrl(target, path);
 
   try {
     const { statusCode, headers, body } = await undiciRequest(url, {
@@ -43,7 +46,7 @@ export async function forwardRequest(target: string, path: string, opts: Forward
       headers: buildOutgoingHeaders(opts),
       ...(opts.body ? { body: opts.body } : {}),
       headersTimeout: opts.timeoutMs,
-      bodyTimeout: opts.timeoutMs,
+      bodyTimeout: opts.bodyTimeoutMs ?? opts.timeoutMs,
     });
 
     return {
@@ -59,7 +62,8 @@ export async function forwardRequest(target: string, path: string, opts: Forward
   }
 }
 
-function buildOutgoingHeaders(opts: ForwardOptions): Record<string, string | string[]> {
+/** Upstream'e giden header'lar: hop-by-hop/host atılır, X-Forwarded-* ve request id eklenir. WebSocket el sıkışması da bunu kullanır. */
+export function buildOutgoingHeaders(opts: Pick<ForwardOptions, 'headers' | 'clientIp' | 'requestId'>): Record<string, string | string[]> {
   const result: Record<string, string | string[]> = {};
 
   for (const [key, value] of Object.entries(opts.headers)) {

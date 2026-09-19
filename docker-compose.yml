@@ -42,6 +42,15 @@ services:
     ports:
       - "4001:4000"
 
+  # A WebSocket echo server for trying the gateway's WebSocket proxying — see
+  # gateway.docker.yaml's `ws-chat` / `ws-private` routes and README § WebSocket.
+  ws-echo:
+    build: ./examples/ws-echo
+    environment:
+      PORT: 4100
+    ports:
+      - "4100:4100"
+
   gateway:
     build: .
     environment:
@@ -59,6 +68,8 @@ services:
       upstream:
         condition: service_started
       upstream2:
+        condition: service_started
+      ws-echo:
         condition: service_started
 
 volumes:

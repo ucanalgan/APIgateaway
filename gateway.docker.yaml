@@ -49,6 +49,53 @@ routes:
         - http://upstream:4000
       timeoutMs: 5000
 
+  # WebSocket proxying (README § WebSocket) — the gateway terminates the
+  # connection and relays messages to ws-echo. Public route: the handshake is
+  # rate limited per IP, each connection is capped at 20 messages / 10s, and at
+  # most 100 connections are open at once.
+  #   npx wscat -c ws://localhost:8080/ws/room
+  - id: ws-chat
+    match:
+      path: /ws/*
+    rewrite:
+      stripPrefix: /ws
+    upstream:
+      targets:
+        - http://ws-echo:4100
+      timeoutMs: 5000
+    rateLimit:
+      algorithm: slidingWindowLog
+      keyBy: [ip]
+      limit: 30
+      windowSec: 60
+    websocket:
+      enabled: true
+      maxConnections: 100
+      messageRateLimit:
+        algorithm: tokenBucket
+        limit: 20
+        windowSec: 10
+
+  # The same, behind API-key auth. Browsers can't set an Authorization header
+  # on a WebSocket, so `queryToken` also accepts `?access_token=<key>` (masked
+  # in the gateway's logs and never forwarded in the URL). Create a key with the
+  # admin API (README § Admin API), then:
+  #   npx wscat -c "ws://localhost:8080/wsp/room?access_token=<raw key>"
+  - id: ws-private
+    match:
+      path: /wsp/*
+    rewrite:
+      stripPrefix: /wsp
+    upstream:
+      targets:
+        - http://ws-echo:4100
+      timeoutMs: 5000
+    auth:
+      type: apiKey
+    websocket:
+      enabled: true
+      queryToken: true
+
   # Two targets + health check + breaker + retry — stop one
   # (`docker compose stop upstream2`) and traffic keeps flowing through the
   # other with no failed requests. See README § Resilience.

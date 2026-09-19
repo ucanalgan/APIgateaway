@@ -1,0 +1,14 @@
+{
+  "name": "ws-echo-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A tiny WebSocket echo server used as an upstream for the gateway's WebSocket proxying",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

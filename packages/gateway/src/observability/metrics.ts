@@ -9,6 +9,9 @@ export interface Metrics {
   setCircuitState(route: string, state: 'closed' | 'open' | 'half-open'): void;
   setUpstreamHealthy(route: string, target: string, healthy: boolean): void;
   observeRedisLatency(seconds: number): void;
+  webSocketOpened(route: string): void;
+  webSocketClosed(route: string, reason: string): void;
+  webSocketMessage(route: string, direction: 'client_to_upstream' | 'upstream_to_client'): void;
 }
 
 const CIRCUIT_STATE_VALUE: Record<'closed' | 'open' | 'half-open', number> = {
@@ -78,6 +81,27 @@ export function createMetrics(): Metrics {
     registers: [registry],
   });
 
+  const websocketConnections = new client.Gauge({
+    name: 'apigate_websocket_connections',
+    help: 'Currently open proxied WebSocket connections',
+    labelNames: ['route'],
+    registers: [registry],
+  });
+
+  const websocketClosed = new client.Counter({
+    name: 'apigate_websocket_closed_total',
+    help: 'Closed WebSocket connections, by why they ended',
+    labelNames: ['route', 'reason'],
+    registers: [registry],
+  });
+
+  const websocketMessages = new client.Counter({
+    name: 'apigate_websocket_messages_total',
+    help: 'WebSocket messages relayed by the gateway',
+    labelNames: ['route', 'direction'],
+    registers: [registry],
+  });
+
   return {
     registry,
     recordRequest(route, status, durationSec, tenantId) {
@@ -101,6 +125,16 @@ export function createMetrics(): Metrics {
     },
     observeRedisLatency(seconds) {
       redisLatency.observe(seconds);
+    },
+    webSocketOpened(route) {
+      websocketConnections.inc({ route });
+    },
+    webSocketClosed(route, reason) {
+      websocketConnections.dec({ route });
+      websocketClosed.inc({ route, reason });
+    },
+    webSocketMessage(route, direction) {
+      websocketMessages.inc({ route, direction });
     },
   };
 }

@@ -61,6 +61,23 @@ routes:
   #   auth: { type: apiKey }
   #   rateLimit: { algorithm: tokenBucket, keyBy: [tenant], limit: 100, windowSec: 60 }
 
+  # WebSocket proxying (README § WebSocket). Needs a WebSocket upstream:
+  #   cd examples/ws-echo && npm install && npm start     # :4100
+  # then `npx wscat -c ws://localhost:8080/ws/room`.
+  # - id: ws-chat
+  #   match: { path: /ws/* }
+  #   rewrite: { stripPrefix: /ws }
+  #   upstream: { targets: [http://localhost:4100] }
+  #   websocket:
+  #     enabled: true
+  #     messageRateLimit: { algorithm: tokenBucket, limit: 20, windowSec: 10 }   # per connection
+
+  # Server-Sent Events: a stream that can go quiet for a long time needs the
+  # upstream body timeout switched off, or it is cut after `timeoutMs` of silence.
+  # - id: events
+  #   match: { path: /events/* }
+  #   upstream: { targets: [http://localhost:4000], bodyTimeoutMs: 0 }
+
   # Run a second upstream fixture (`PORT=4001 node examples/upstream/index.js`)
   # and try this to see failover — stop either one, traffic keeps flowing
   # through the other with no failed requests (see README § Resilience).

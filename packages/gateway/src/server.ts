@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Readable } from 'node:stream';
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { Redis } from 'ioredis';
 import { decideCacheability } from '@apigate/core/cache';
 import type { GatewayConfig } from './config/schema.js';
@@ -20,8 +20,12 @@ import { createCacheStores, buildCacheKey, cacheKeyPrefix, stripUncacheableHeade
 import { createDbPool, runMigrations, type DbPool } from './db/client.js';
 import { createUsageBuffer } from './usage/buffer.js';
 import { createMetrics } from './observability/metrics.js';
-import { REDACT_PATHS } from './observability/logger.js';
+import { REDACT_PATHS, serializeRequest } from './observability/logger.js';
 import { registerAdminRoutes } from './admin/routes.js';
+import { attachUpgradeListener, handshakeProblem, isWebSocketHandshake, pendingUpgrade } from './websocket/upgrade.js';
+import { createWebSocketRegistry } from './websocket/registry.js';
+import { proxyWebSocket } from './websocket/proxy.js';
+import { extractQueryToken, stripQueryParam } from './websocket/url.js';
 import type { Store } from '@apigate/core/ratelimit';
 import type { CacheStore } from '@apigate/core/cache';
 
@@ -119,6 +123,7 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
 
   const usageBuffer = dbPool ? createUsageBuffer(dbPool) : undefined;
   const metrics = createMetrics();
+  const webSocketRegistry = createWebSocketRegistry();
 
   const trustProxyHops = initialConfig.server.trustProxyHops;
   // "N hop güvenilir" demek: bizim doğrudan bağlandığımız taraf (hop 0) ve
@@ -147,7 +152,7 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
     : undefined;
 
   const app = Fastify({
-    logger: { redact: { paths: REDACT_PATHS, censor: '[redacted]' } },
+    logger: { redact: { paths: REDACT_PATHS, censor: '[redacted]' }, serializers: { req: serializeRequest } },
     trustProxy,
     bodyLimit: initialConfig.server.maxBodyBytes,
     requestTimeout: initialConfig.server.requestTimeoutMs,
@@ -162,6 +167,12 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
     app.log.warn({ err }, 'postgres pool error');
   });
   if (redisClient) await waitForRedis(redisClient);
+
+  attachUpgradeListener(app);
+  // Yükseltilmiş soketler HTTP sunucusunun kapanışını süresiz bekletir; önce onları kapat.
+  app.addHook('preClose', async () => {
+    await webSocketRegistry.closeAll(2_000);
+  });
 
   app.decorateRequest('apigateTenantId', undefined);
   app.decorateRequest('apigateRouteId', undefined);
@@ -275,12 +286,59 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
     return metrics.registry.metrics();
   });
 
+  function sendProxyError(err: unknown, routeId: string, request: FastifyRequest, reply: FastifyReply): FastifyReply {
+    if (err instanceof BodyTooLargeError) {
+      return reply.code(413).send({
+        error: 'payload_too_large',
+        message: err.message,
+        requestId: request.id,
+      });
+    }
+
+    if (err instanceof UpstreamTimeoutError) {
+      metrics.recordUpstreamError(routeId, 'timeout');
+      return reply.code(504).send({
+        error: 'upstream_timeout',
+        message: err.message,
+        requestId: request.id,
+      });
+    }
+
+    if (err instanceof NoHealthyTargetError) {
+      metrics.recordUpstreamError(routeId, 'no_healthy_target');
+      return reply.code(503).send({
+        error: 'service_unavailable',
+        message: err.message,
+        requestId: request.id,
+      });
+    }
+
+    metrics.recordUpstreamError(routeId, 'connection');
+    request.log.error({ err, route: routeId }, 'upstream request failed');
+    return reply.code(502).send({
+      error: 'bad_gateway',
+      message: 'Upstream request failed.',
+      requestId: request.id,
+    });
+  }
+
   app.all('/*', async (request, reply) => {
     const path = request.url.split('?')[0] ?? '/';
     // `request.hostname` X-Forwarded-Host'a sadece trustProxy'nin güvendiği bir
     // hop'tan geldiyse bakar — istemci kendi başına host'unu sahteleyip başka
     // bir route'a düşemez.
     const host = normalizeHost(request.hostname);
+
+    // `upgrade` olayından gelen isteklerde (bkz. websocket/upgrade.ts) tanımlı;
+    // sıradan HTTP isteklerinde `undefined`.
+    const upgrade = pendingUpgrade(request.raw);
+    if (upgrade && !isWebSocketHandshake(request.raw)) {
+      return reply.code(400).send({
+        error: 'upgrade_not_supported',
+        message: 'Only WebSocket upgrades are supported.',
+        requestId: request.id,
+      });
+    }
 
     // CORS preflight: tarayıcı bunu her zaman `OPTIONS` + kendi ürettiği
     // `Access-Control-Request-Method` header'ıyla gönderir — bir istemci
@@ -316,6 +374,52 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
 
     request.apigateRouteId = route.id;
 
+    // Upstream'e gidecek URL — WebSocket'te `?access_token=` buradan çıkarılır.
+    let upstreamUrl = request.url;
+
+    if (upgrade) {
+      const wsConfig = route.websocket;
+
+      if (!wsConfig?.enabled) {
+        return reply.code(400).send({
+          error: 'websocket_not_enabled',
+          message: `Route "${route.id}" does not accept WebSocket connections.`,
+          requestId: request.id,
+        });
+      }
+
+      const problem = handshakeProblem(request.raw);
+      if (problem) {
+        return reply.code(400).send({ error: 'bad_handshake', message: problem, requestId: request.id });
+      }
+
+      // Origin'i olan (tarayıcı) bir istek listede yoksa reddedilir; Origin
+      // göndermeyen sunucu-tarafı istemciler bu kontrolün konusu değil.
+      const origin = request.headers.origin;
+      if (
+        wsConfig.origins &&
+        typeof origin === 'string' &&
+        !wsConfig.origins.includes('*') &&
+        !wsConfig.origins.includes(origin)
+      ) {
+        return reply.code(403).send({
+          error: 'origin_not_allowed',
+          message: 'This Origin is not allowed to open a WebSocket on this route.',
+          requestId: request.id,
+        });
+      }
+
+      if (wsConfig.queryToken) {
+        // Tarayıcı `Authorization` gönderemez: token'ı sorgu dizesinden alıp
+        // normal auth katmanının beklediği yere koyuyoruz.
+        if (!request.headers.authorization) {
+          const token = extractQueryToken(request.url);
+          if (token) request.headers.authorization = `Bearer ${token}`;
+        }
+        upstreamUrl = stripQueryParam(request.url);
+      }
+    }
+
     const authOutcome = await authenticateRequest(route, request, reply, {
       ...(dbPool !== undefined ? { db: dbPool } : {}),
       ...(redisClient !== undefined ? { redis: redisClient } : {}),
@@ -344,6 +448,23 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
         metrics.observeRedisLatency(Number(process.hrtime.bigint() - startedAt) / 1e9);
         metrics.recordRateLimitDecision(route.id, proceed ? 'allowed' : 'blocked');
         if (!proceed) return reply;
+      }
+    }
+
+    if (upgrade) {
+      try {
+        return await proxyWebSocket({
+          route,
+          balancer: state.balancers.get(route.id)!,
+          request,
+          reply,
+          upgrade,
+          upstreamPath: rewritePath(upstreamUrl, route),
+          headers: applyRequestTransform(route, request.headers),
+          deps: { registry: webSocketRegistry, metrics, usageBuffer },
+        });
+      } catch (err) {
+        return sendProxyError(err, route.id, request, reply);
       }
     }
 
@@ -379,6 +500,7 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
         headers: applyRequestTransform(route, request.headers),
         body: hasBody ? (request.body as Readable) : undefined,
         timeoutMs: route.upstream.timeoutMs,
+        ...(route.upstream.bodyTimeoutMs !== undefined ? { bodyTimeoutMs: route.upstream.bodyTimeoutMs } : {}),
         clientIp: request.ip,
         requestId: String(request.id),
       });
@@ -417,39 +539,7 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
 
       return reply.send(upstream.body);
     } catch (err) {
-      if (err instanceof BodyTooLargeError) {
-        return reply.code(413).send({
-          error: 'payload_too_large',
-          message: err.message,
-          requestId: request.id,
-        });
-      }
-
-      if (err instanceof UpstreamTimeoutError) {
-        metrics.recordUpstreamError(route.id, 'timeout');
-        return reply.code(504).send({
-          error: 'upstream_timeout',
-          message: err.message,
-          requestId: request.id,
-        });
-      }
-
-      if (err instanceof NoHealthyTargetError) {
-        metrics.recordUpstreamError(route.id, 'no_healthy_target');
-        return reply.code(503).send({
-          error: 'service_unavailable',
-          message: err.message,
-          requestId: request.id,
-        });
-      }
-
-      metrics.recordUpstreamError(route.id, 'connection');
-      request.log.error({ err, route: route.id }, 'upstream request failed');
-      return reply.code(502).send({
-        error: 'bad_gateway',
-        message: 'Upstream request failed.',
-        requestId: request.id,
-      });
+      return sendProxyError(err, route.id, request, reply);
     }
   });
 

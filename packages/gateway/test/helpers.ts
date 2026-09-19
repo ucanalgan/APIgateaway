@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import type { Duplex } from 'node:stream';
 import type { FastifyInstance } from 'fastify';
 import { Redis } from 'ioredis';
 import pg from 'pg';
+import WsClient, { WebSocketServer, type ClientOptions as WsClientOptions } from 'ws';
 import { gatewayConfigSchema } from '../src/config/schema.js';
 import { createDbPool, runMigrations, type DbPool } from '../src/db/client.js';
 import { buildServer } from '../src/server.js';
@@ -148,3 +150,138 @@ export async function createTestDatabase(): Promise<TestDatabase | undefined> {
     return undefined;
   }
 }
+
+// ---------------------------------------------------------------------------
+// WebSocket helpers — a real `ws` server as the upstream, real `ws` clients.
+// ---------------------------------------------------------------------------
+
+export interface WsUpstreamOptions {
+  /** Picks the sub-protocol (or `false` for none) from what the client offered. */
+  readonly protocols?: (offered: Set<string>) => string | false;
+  /** Answer the handshake with a plain HTTP response instead of upgrading. */
+  readonly reject?: { readonly status: number; readonly body?: string };
+  /** Accept the TCP connection but never answer the handshake. */
+  readonly hangHandshake?: boolean;
+  /** Plain HTTP requests (non-upgrade) to the same server; without it they hang. */
+  readonly http?: (req: IncomingMessage, res: ServerResponse) => void;
+  /** Called for each accepted connection; the default echoes every message back unchanged. */
+  readonly onConnection?: (ws: WsClient, request: IncomingMessage) => void;
+}
+
+export interface WsUpstreamMessage {
+  readonly data: Buffer;
+  readonly isBinary: boolean;
+}
+
+export interface TestWsUpstream {
+  /** http:// URL — what a route's `upstream.targets` takes. */
+  readonly url: string;
+  readonly handshakes: IncomingMessage[];
+  readonly sockets: WsClient[];
+  readonly received: WsUpstreamMessage[];
+  close(): Promise<void>;
+}
+
+export async function startWsUpstream(options: WsUpstreamOptions = {}): Promise<TestWsUpstream> {
+  const handshakes: IncomingMessage[] = [];
+  const sockets: WsClient[] = [];
+  const received: WsUpstreamMessage[] = [];
+  // Sockets that emitted 'upgrade' are detached from the http server, so
+  // `closeAllConnections()` no longer reaches them — track them to clean up.
+  const rawSockets = new Set<Duplex>();
+
+  const wss = new WebSocketServer({
+    noServer: true,
+    ...(options.protocols ? { handleProtocols: options.protocols } : {}),
+  });
+  const server = options.http ? createServer(options.http) : createServer();
+
+  server.on('upgrade', (req, socket, head) => {
+    handshakes.push(req);
+    rawSockets.add(socket);
+    socket.once('close', () => rawSockets.delete(socket));
+
+    if (options.hangHandshake) {
+      // Never answer, but do notice when the peer gives up.
+      socket.on('end', () => socket.destroy());
+      socket.resume();
+      return;
+    }
+    if (options.reject) {
+      const body = options.reject.body ?? '';
+      socket.end(
+        `HTTP/1.1 ${options.reject.status} Rejected\r\ncontent-type: text/plain\r\ncontent-length: ${Buffer.byteLength(body)}\r\nconnection: close\r\n\r\n${body}`,
+      );
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      sockets.push(ws);
+      if (options.onConnection) {
+        options.onConnection(ws, req);
+        return;
+      }
+      ws.on('message', (data, isBinary) => {
+        received.push({ data: data as Buffer, isBinary });
+        ws.send(data as Buffer, { binary: isBinary });
+      });
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+
+  return {
+    url: `http://127.0.0.1:${port}`,
+    handshakes,
+    sockets,
+    received,
+    close: async () => {
+      for (const ws of sockets) ws.terminate();
+      for (const socket of rawSockets) socket.destroy();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      wss.close();
+    },
+  };
+}
+
+/** `http://host:port` (what `listen(app)` returns) → `ws://host:port/path`. */
+export const wsUrl = (base: string, path: string): string => base.replace(/^http/, 'ws') + path;
+
+export function connectWs(url: string, protocols?: string[], options: WsClientOptions = {}): Promise<WsClient> {
+  return new Promise((resolve, reject) => {
+    const ws = new WsClient(url, protocols ?? [], options);
+    ws.once('open', () => resolve(ws));
+    ws.once('error', reject);
+  });
+}
+
+/** Attempts a handshake that must be refused; resolves with the HTTP response the gateway sent. */
+export function rejectedHandshake(
+  url: string,
+  options: WsClientOptions = {},
+): Promise<{ statusCode: number; body: string; headers: IncomingMessage['headers'] }> {
+  return new Promise((resolve, reject) => {
+    const ws = new WsClient(url, [], options);
+    ws.on('error', reject); // a refused/reset connection must fail the test, not hang it
+    ws.once('open', () => {
+      ws.terminate();
+      reject(new Error('handshake unexpectedly succeeded'));
+    });
+    ws.once('unexpected-response', (_req, res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => {
+        resolve({ statusCode: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8'), headers: res.headers });
+        ws.terminate();
+      });
+    });
+  });
+}
+
+export const nextMessage = (ws: WsClient): Promise<{ data: Buffer; isBinary: boolean }> =>
+  new Promise((resolve) => ws.once('message', (data, isBinary) => resolve({ data: data as Buffer, isBinary })));
+
+export const nextClose = (ws: WsClient): Promise<{ code: number; reason: string }> =>
+  new Promise((resolve) => ws.once('close', (code, reason) => resolve({ code, reason: reason.toString('utf8') })));

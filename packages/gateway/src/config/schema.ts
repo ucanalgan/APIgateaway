@@ -11,8 +11,23 @@ const upstreamSchema = z.object({
       intervalMs: z.number().int().positive().default(10000),
     })
     .optional(),
+  /** Başlık gelene kadar ve (aşağıdaki `bodyTimeoutMs` yoksa) gövde parçaları arasında beklenen azami süre. */
   timeoutMs: z.number().int().positive().default(5000),
+  /**
+   * İki gövde parçası arasında beklenen azami süre — verilmezse `timeoutMs`.
+   * `0` = sınırsız: SSE gibi uzun süre sessiz kalabilen akışlar için (aksi halde
+   * `timeoutMs` kadar sessizlikte akış ortasında kesilir).
+   */
+  bodyTimeoutMs: z.number().int().nonnegative().optional(),
 });
+
+const rateLimitAlgorithmSchema = z.enum([
+  'tokenBucket',
+  'slidingWindowLog',
+  'slidingWindowCounter',
+  'fixedWindow',
+  'leakyBucket',
+]);
 
 const authSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('none') }),
@@ -37,9 +52,7 @@ const globalRateLimitSchema = z.object({
 
 const rateLimitSchema = z
   .object({
-    algorithm: z
-      .enum(['tokenBucket', 'slidingWindowLog', 'slidingWindowCounter', 'fixedWindow', 'leakyBucket'])
-      .default('tokenBucket'),
+    algorithm: rateLimitAlgorithmSchema.default('tokenBucket'),
     keyBy: z.array(z.enum(['tenant', 'ip', 'global'])).min(1).default(['ip']),
     limit: z.number().int().positive(),
     windowSec: z.number().int().positive(),
@@ -94,6 +107,42 @@ const corsSchema = z.object({
   maxAgeSec: z.number().int().nonnegative().default(600),
 });
 
+const websocketSchema = z.object({
+  /** Açık değilse route'a gelen WebSocket el sıkışması reddedilir (opt-in). */
+  enabled: z.boolean().default(false),
+  /** Verilirse yalnızca bu `Origin`'lerden gelen el sıkışmalar kabul edilir; `'*'` = hepsi. */
+  origins: z.array(z.string().min(1)).min(1).optional(),
+  /**
+   * `?access_token=` ile token kabul eder — tarayıcıdaki `new WebSocket()`
+   * `Authorization` başlığı gönderemez. Token loglardan maskelenir ve upstream'e
+   * URL'de iletilmez (başlık olarak iletilir). URL'ler proxy/CDN loglarında
+   * dolaşabildiği için varsayılan kapalı.
+   */
+  queryToken: z.boolean().default(false),
+  /** Bu route için bu gateway instance'ındaki azami eşzamanlı bağlantı. */
+  maxConnections: z.number().int().positive().default(1000),
+  /** Tek bir mesajın azami boyutu (iki yönde de) — aşılırsa bağlantı 1009 ile kapanır. */
+  maxMessageBytes: z.number().int().positive().default(1_048_576),
+  /** Yavaş bir tarafa birikmiş azami gönderilmemiş bayt — aşılırsa bağlantı 1013 ile kapanır. */
+  maxBufferedBytes: z.number().int().positive().default(4_194_304),
+  /** Her iki tarafa ping aralığı; pong gelmeyen taraf ölü sayılıp bağlantı kesilir. `0` = kapalı. */
+  pingIntervalMs: z.number().int().nonnegative().default(30_000),
+  /** Bu süre boyunca hiçbir yönde mesaj akmazsa bağlantı 1001 ile kapanır. `0` = kapalı. */
+  idleTimeoutMs: z.number().int().nonnegative().default(0),
+  /**
+   * İstemciden upstream'e mesaj başına limit — bağlantı BAŞINA sayılır (aşılırsa
+   * bağlantı 1008 ile kapanır). El sıkışma limiti ayrıca route'un `rateLimit`'idir.
+   */
+  messageRateLimit: z
+    .object({
+      algorithm: rateLimitAlgorithmSchema.default('tokenBucket'),
+      limit: z.number().int().positive(),
+      windowSec: z.number().int().positive(),
+      burst: z.number().int().positive().optional(),
+    })
+    .optional(),
+});
+
 const retrySchema = z.object({
   attempts: z.number().int().nonnegative().default(0),
   backoffMs: z.number().int().positive().default(100),
@@ -133,6 +182,7 @@ const routeSchema = z.object({
   rateLimit: rateLimitSchema.optional(),
   cache: cacheSchema.optional(),
   cors: corsSchema.optional(),
+  websocket: websocketSchema.optional(),
   transform: transformSchema.optional(),
   retry: retrySchema.optional(),
   circuitBreaker: circuitBreakerSchema.optional(),
