@@ -143,7 +143,7 @@ describe('CORS', () => {
           match: { path: '/api/*' },
           upstream: { targets: [upstream.url] },
           cors: { enabled: true, origins: ['https://app.example.com'] },
-          rateLimit: { algorithm: 'fixedWindow', keyBy: ['ip'], limit: 1, windowSec: 60 },
+          rateLimit: { algorithm: 'slidingWindowLog', keyBy: ['ip'], limit: 1, windowSec: 60 },
         },
       ],
     });

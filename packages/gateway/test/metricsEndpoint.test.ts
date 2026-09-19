@@ -20,7 +20,7 @@ describe('GET /metrics', () => {
         id: 'shop',
         match: { path: '/shop/*' },
         upstream: { targets: [up.url, await deadUrl()] },
-        rateLimit: { algorithm: 'fixedWindow', keyBy: ['ip'], limit: 2, windowSec: 60 },
+        rateLimit: { algorithm: 'slidingWindowLog', keyBy: ['ip'], limit: 2, windowSec: 60 },
         cache: { enabled: true, ttlSec: 60 },
         circuitBreaker: { failureThreshold: 5, resetTimeoutMs: 60_000 },
       },

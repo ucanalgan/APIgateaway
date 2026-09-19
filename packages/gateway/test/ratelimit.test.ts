@@ -69,7 +69,7 @@ describe('global rate-limit key — real request pipeline', () => {
           match: { path: '/api/*' },
           upstream: { targets: [upstream.url] },
           rateLimit: {
-            algorithm: 'fixedWindow',
+            algorithm: 'slidingWindowLog',
             keyBy: ['ip', 'global'],
             limit: 100, // per-IP: generous, never the bottleneck in this test
             windowSec: 60,
@@ -101,7 +101,7 @@ describe('global rate-limit key — real request pipeline', () => {
           id: 'r',
           match: { path: '/api/*' },
           upstream: { targets: [upstream.url] },
-          rateLimit: { algorithm: 'fixedWindow', keyBy: ['ip'], limit: 1, windowSec: 60 },
+          rateLimit: { algorithm: 'slidingWindowLog', keyBy: ['ip'], limit: 1, windowSec: 60 },
         },
       ],
     });

@@ -1,7 +1,7 @@
 # APIGate
 
 [![CI](https://github.com/ucanalgan/apigate/actions/workflows/ci.yml/badge.svg)](https://github.com/ucanalgan/apigate/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](#coverage)
+[![Coverage](https://img.shields.io/badge/coverage-96%25-brightgreen)](#coverage)
 
 A framework-agnostic API Gateway and rate limiter, built as a learning project and
 as a reusable building block.
@@ -524,8 +524,8 @@ npm run coverage   # vitest run --coverage (needs Redis/Postgres reachable, same
 ```
 
 The badge is `v8`-measured statement coverage from the full suite run
-against real Redis and Postgres: **95% statements, 92% branches, 94%
-functions** (216 tests). It's a hand-updated number — re-run the command
+against real Redis and Postgres: **96% statements, 92% branches, 95%
+functions** (235 tests). It's a hand-updated number — re-run the command
 above and edit the badge at the top of this file when it moves.
 
 Two layers of tests produce it. `packages/core` — the framework-agnostic

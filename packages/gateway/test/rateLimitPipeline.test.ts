@@ -33,7 +33,7 @@ const limited = (target: string, rateLimit: Record<string, unknown>, id = 'r') =
 describe('rate-limit response contract', () => {
   it('sets RateLimit-* on allowed requests, and Retry-After + the 429 body once exceeded', async () => {
     const up = await upstream();
-    const gw = await app([limited(up.url, { algorithm: 'fixedWindow', keyBy: ['ip'], limit: 2, windowSec: 60 })]);
+    const gw = await app([limited(up.url, { algorithm: 'slidingWindowLog', keyBy: ['ip'], limit: 2, windowSec: 60 })]);
 
     const first = await gw.inject({ method: 'GET', url: '/x' });
     await gw.inject({ method: 'GET', url: '/x' });
@@ -53,7 +53,7 @@ describe('rate-limit response contract', () => {
 
   it('skips a tenant key on an anonymous route instead of failing closed', async () => {
     const up = await upstream();
-    const gw = await app([limited(up.url, { algorithm: 'fixedWindow', keyBy: ['tenant'], limit: 1, windowSec: 60 })]);
+    const gw = await app([limited(up.url, { algorithm: 'slidingWindowLog', keyBy: ['tenant'], limit: 1, windowSec: 60 })]);
 
     const statuses = [];
     for (let i = 0; i < 3; i++) statuses.push((await gw.inject({ method: 'GET', url: '/x' })).statusCode);
@@ -68,7 +68,7 @@ describe('Redis unreachable (real dead port, not a mock)', () => {
   it('failOpen: true — the request goes through instead of the limiter causing an outage', async () => {
     const up = await upstream();
     const gw = await app(
-      [limited(up.url, { algorithm: 'fixedWindow', keyBy: ['ip'], limit: 1, windowSec: 60 })],
+      [limited(up.url, { algorithm: 'slidingWindowLog', keyBy: ['ip'], limit: 1, windowSec: 60 })],
       { redis: { url: DEAD_REDIS, failOpen: true } },
     );
 
@@ -82,7 +82,7 @@ describe('Redis unreachable (real dead port, not a mock)', () => {
   it('failOpen: false — answers 503 rate_limit_unavailable and never reaches the upstream', async () => {
     const up = await upstream();
     const gw = await app(
-      [limited(up.url, { algorithm: 'fixedWindow', keyBy: ['ip'], limit: 1, windowSec: 60 })],
+      [limited(up.url, { algorithm: 'slidingWindowLog', keyBy: ['ip'], limit: 1, windowSec: 60 })],
       { redis: { url: DEAD_REDIS, failOpen: false } },
     );
 
@@ -96,7 +96,7 @@ describe('Redis unreachable (real dead port, not a mock)', () => {
   it('still shuts down cleanly with Redis down (no hang, no throw)', async () => {
     const up = await upstream();
     const gw = await buildTestApp(
-      [limited(up.url, { algorithm: 'fixedWindow', keyBy: ['ip'], limit: 1, windowSec: 60 })],
+      [limited(up.url, { algorithm: 'slidingWindowLog', keyBy: ['ip'], limit: 1, windowSec: 60 })],
       { redis: { url: DEAD_REDIS } },
     );
 
@@ -104,7 +104,7 @@ describe('Redis unreachable (real dead port, not a mock)', () => {
   });
 
   it('an unreachable target still fails fast when the limiter is healthy', async () => {
-    const gw = await app([limited(await deadUrl(), { algorithm: 'fixedWindow', keyBy: ['ip'], limit: 5, windowSec: 60 })]);
+    const gw = await app([limited(await deadUrl(), { algorithm: 'slidingWindowLog', keyBy: ['ip'], limit: 5, windowSec: 60 })]);
 
     expect((await gw.inject({ method: 'GET', url: '/x' })).statusCode).toBe(502);
   });
@@ -134,7 +134,7 @@ describe.skipIf(!redisAvailable)('distributed limits through real Redis', () => 
     const up = await upstream();
     const route = limited(
       up.url,
-      { algorithm: 'fixedWindow', keyBy: ['ip', 'global'], limit: 100, windowSec: 60, global: { limit: 2, windowSec: 60 } },
+      { algorithm: 'slidingWindowLog', keyBy: ['ip', 'global'], limit: 100, windowSec: 60, global: { limit: 2, windowSec: 60 } },
       `global-${randomUUID()}`,
     );
     const gatewayA = await app([route], { redis: { url: REDIS_URL } });

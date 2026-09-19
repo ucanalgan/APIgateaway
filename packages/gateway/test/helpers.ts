@@ -8,6 +8,12 @@ import { gatewayConfigSchema } from '../src/config/schema.js';
 import { createDbPool, runMigrations, type DbPool } from '../src/db/client.js';
 import { buildServer } from '../src/server.js';
 
+// Rate-limit tests that send a fixed number of requests and expect a 429 must NOT use
+// the `fixedWindow` algorithm: its windows are aligned to the wall clock, so a
+// test that happens to straddle a minute boundary gets a fresh counter and
+// flakes. `slidingWindowLog` counts the trailing window from the request
+// itself, so the outcome is deterministic for any test that finishes within it.
+
 export interface RecordedRequest {
   readonly method: string;
   readonly url: string;

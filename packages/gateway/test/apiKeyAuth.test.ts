@@ -59,7 +59,7 @@ async function gateway(extra: Record<string, unknown> = {}): Promise<FastifyInst
         upstream: { targets: [up.url] },
         auth: { type: 'apiKey' },
         // Static route limit is deliberately huge: the plan's limit must be what applies.
-        rateLimit: { algorithm: 'fixedWindow', keyBy: ['tenant'], limit: 1000, windowSec: 60 },
+        rateLimit: { algorithm: 'slidingWindowLog', keyBy: ['tenant'], limit: 1000, windowSec: 60 },
       },
     ],
     { db: { url: db!.url }, ...extra },

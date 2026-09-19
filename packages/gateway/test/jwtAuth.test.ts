@@ -113,7 +113,7 @@ describe('JWT auth', () => {
   });
 
   it('feeds the token\'s tenant claim into a tenant-keyed rate limit', async () => {
-    const gw = await jwtApp({ rateLimit: { algorithm: 'fixedWindow', keyBy: ['tenant'], limit: 1, windowSec: 60 } });
+    const gw = await jwtApp({ rateLimit: { algorithm: 'slidingWindowLog', keyBy: ['tenant'], limit: 1, windowSec: 60 } });
     const tenantA = bearer(await sign({ tenant_id: 'tenant-a' }));
     const tenantB = bearer(await sign({ tenant_id: 'tenant-b' }));
 
