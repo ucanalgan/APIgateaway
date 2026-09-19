@@ -310,6 +310,10 @@ cache:
   varyBy: [Accept, Accept-Language]   # separate cache entries per header value
 ```
 
+The cache key includes the query string — `/items?page=1` and `/items?page=2`
+are separate entries — and a route's cache can be emptied on demand (see
+[§ Admin API](#admin-api)).
+
 **The cache key is scoped by tenant whenever the route has `auth` enabled**,
 on top of whatever `varyBy` lists — this isn't configurable, and it's not
 about response formatting: `varyBy` is for content-negotiation headers, not
@@ -426,7 +430,19 @@ curl http://localhost:8080/admin/tenants -H "Authorization: Bearer $TOKEN"
 curl -X POST http://localhost:8080/admin/tenants/<id>/keys -H "Authorization: Bearer $TOKEN" -d '{"name":"prod"}'
 curl -X DELETE http://localhost:8080/admin/keys/<id> -H "Authorization: Bearer $TOKEN"   # instant, clears the cache too
 curl "http://localhost:8080/admin/usage?tenantId=<id>&sinceHours=24" -H "Authorization: Bearer $TOKEN"
+curl -X DELETE "http://localhost:8080/admin/cache?routeId=cached-echo" -H "Authorization: Bearer $TOKEN"   # empty a route's response cache
+curl -X DELETE "http://localhost:8080/admin/cache?routeId=cached-echo&path=/cached/hello" -H "Authorization: Bearer $TOKEN"   # ...or just one path
 ```
+
+**Cache purge** (`DELETE /admin/cache`) answers `{ "routeId", "purged": <n> }`.
+With just `routeId` it empties that route's cache; add `path` (the path the
+client requested, i.e. *before* `rewrite`) to drop only that path — every
+variant of it at once: each query string, each tenant, each `varyBy` value.
+It can't target a single query string or tenant on its own, because those
+live inside a hashed key. `404` if the route doesn't exist or has no `cache`.
+With `redis` configured the cache is shared, so one purge reaches every
+gateway instance; without it each instance holds its own in-process cache and
+a purge only clears the instance that received it.
 
 Key creation returns the raw key **once**, the same way `npm run seed` does
 — see [packages/gateway/src/admin/routes.ts](packages/gateway/src/admin/routes.ts)

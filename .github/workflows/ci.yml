@@ -40,6 +40,10 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
+      # `typecheck` only emits .js/.d.ts — `build` also copies the Lua scripts
+      # and gateway assets, so this is what catches a broken build (the
+      # Dockerfile broke once precisely because CI never ran it).
+      - run: npm run build
       - run: npm run test
         env:
           REDIS_URL: redis://localhost:6379

@@ -177,6 +177,22 @@ describe.skipIf(!db)('API key auth (real Postgres)', () => {
     expect(rows[0]).toMatchObject({ n: 2, route_id: 'api' });
   });
 
+  it('survives Postgres terminating its idle connections (restart/failover) — no crash, the next request reconnects', async () => {
+    const { key } = await seed();
+    const gw = await gateway();
+    expect((await gw.inject({ method: 'GET', url: '/api/x', headers: bearer(key.raw) })).statusCode).toBe(200);
+
+    // What a Postgres restart or failover does to a pool's idle clients: the
+    // backend is terminated, the pool emits 'error'. Unhandled, that error
+    // kills the whole process.
+    await db!.pool.query(
+      'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()',
+    );
+    await sleep(150);
+
+    expect((await gw.inject({ method: 'GET', url: '/api/x', headers: bearer(key.raw) })).statusCode).toBe(200);
+  });
+
   it('degrades to Postgres when the Redis auth cache is unreachable — auth keeps working', async () => {
     const { key } = await seed();
     const gw = await gateway({ redis: { url: 'redis://127.0.0.1:1', failOpen: true } });

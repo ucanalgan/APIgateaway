@@ -82,6 +82,24 @@ describe('response cache (in-process store)', () => {
     expect(up.requests).toHaveLength(2);
   });
 
+  it('keeps a separate entry per query string — /items?page=1 must never be served for /items?page=2', async () => {
+    const up = await upstream((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end(`you asked for ${req.url}`);
+    });
+    app = await buildTestApp([cachedRoute(up.url)]);
+
+    const page1 = await app.inject({ method: 'GET', url: '/items?page=1' });
+    const page2 = await app.inject({ method: 'GET', url: '/items?page=2' });
+    const page1Again = await app.inject({ method: 'GET', url: '/items?page=1' });
+
+    expect(page1.body).toBe('you asked for /items?page=1');
+    expect(page2.body).toBe('you asked for /items?page=2');
+    expect(page2.headers['x-cache']).toBe('MISS');
+    expect(page1Again.headers['x-cache']).toBe('HIT');
+    expect(up.requests).toHaveLength(2);
+  });
+
   it('does not cache non-GET methods', async () => {
     const up = await upstream();
     app = await buildTestApp([cachedRoute(up.url)]);

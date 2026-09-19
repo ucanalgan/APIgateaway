@@ -297,6 +297,124 @@ describe.skipIf(!db)('admin API (real Postgres)', () => {
   });
 });
 
+async function cachingGateway(extra: Record<string, unknown> = {}): Promise<FastifyInstance> {
+  up = await startUpstream();
+  const cached = (id: string) => ({
+    id,
+    match: { path: `/${id}/*` },
+    upstream: { targets: [up!.url] },
+    cache: { enabled: true, ttlSec: 300 },
+  });
+  app = await buildTestApp(
+    [cached('catalog'), cached('reviews'), { id: 'plain', match: { path: '/plain/*' }, upstream: { targets: [up.url] } }],
+    { db: { url: db!.url }, admin: { token: TOKEN }, ...extra },
+  );
+  return app;
+}
+
+const xCache = async (gw: FastifyInstance, url: string): Promise<unknown> =>
+  (await gw.inject({ method: 'GET', url })).headers['x-cache'];
+
+describe.skipIf(!db)('admin cache purge (real Postgres)', () => {
+  it('purges a whole route — its entries miss again, other routes\' entries are untouched', async () => {
+    const gw = await cachingGateway();
+    for (const url of ['/catalog/a', '/catalog/b', '/reviews/a']) await gw.inject({ method: 'GET', url });
+    expect(await xCache(gw, '/catalog/a')).toBe('HIT');
+
+    const res = await gw.inject({ method: 'DELETE', url: '/admin/cache?routeId=catalog', headers: admin });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ routeId: 'catalog', purged: 2 });
+    expect(await xCache(gw, '/catalog/a')).toBe('MISS');
+    expect(await xCache(gw, '/catalog/b')).toBe('MISS');
+    expect(await xCache(gw, '/reviews/a')).toBe('HIT');
+  });
+
+  it('purges one path with all its variants (query strings) but leaves other paths alone', async () => {
+    const gw = await cachingGateway();
+    for (const url of ['/catalog/a?page=1', '/catalog/a?page=2', '/catalog/a', '/catalog/b']) {
+      await gw.inject({ method: 'GET', url });
+    }
+
+    const res = await gw.inject({
+      method: 'DELETE',
+      url: `/admin/cache?routeId=catalog&path=${encodeURIComponent('/catalog/a')}`,
+      headers: admin,
+    });
+
+    expect(res.json()).toEqual({ routeId: 'catalog', path: '/catalog/a', purged: 3 });
+    expect(await xCache(gw, '/catalog/a?page=1')).toBe('MISS');
+    expect(await xCache(gw, '/catalog/a?page=2')).toBe('MISS');
+    expect(await xCache(gw, '/catalog/b')).toBe('HIT');
+  });
+
+  it('reports purged: 0 when there is nothing cached', async () => {
+    const gw = await cachingGateway();
+
+    const res = await gw.inject({ method: 'DELETE', url: '/admin/cache?routeId=catalog', headers: admin });
+
+    expect(res.json()).toEqual({ routeId: 'catalog', purged: 0 });
+  });
+
+  it('answers 404 for an unknown route and for a route that has no cache enabled', async () => {
+    const gw = await cachingGateway();
+
+    for (const routeId of ['does-not-exist', 'plain']) {
+      const res = await gw.inject({ method: 'DELETE', url: `/admin/cache?routeId=${routeId}`, headers: admin });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toMatchObject({ error: 'not_found' });
+    }
+  });
+
+  it('answers 400 for a missing routeId or a path that does not start with "/"', async () => {
+    const gw = await cachingGateway();
+
+    const noRoute = await gw.inject({ method: 'DELETE', url: '/admin/cache', headers: admin });
+    const badPath = await gw.inject({ method: 'DELETE', url: '/admin/cache?routeId=catalog&path=catalog/a', headers: admin });
+
+    expect(noRoute.statusCode).toBe(400);
+    expect(badPath.statusCode).toBe(400);
+  });
+
+  it('requires the admin token', async () => {
+    const gw = await cachingGateway();
+
+    const res = await gw.inject({ method: 'DELETE', url: '/admin/cache?routeId=catalog' });
+
+    expect(res.statusCode).toBe(401);
+  });
+});
+
+describe.skipIf(!db || !redisAvailable)('admin cache purge through real Redis', () => {
+  it('a purge on one gateway instance empties the cache another instance is serving from', async () => {
+    const routeId = `catalog-${randomUUID()}`;
+    up = await startUpstream();
+    const route = {
+      id: routeId,
+      match: { path: '/catalog/*' },
+      upstream: { targets: [up.url] },
+      cache: { enabled: true, ttlSec: 300 },
+    };
+    const serving = await buildTestApp([route], { redis: { url: REDIS_URL } });
+    const operator = await buildTestApp([route], { redis: { url: REDIS_URL }, db: { url: db!.url }, admin: { token: TOKEN } });
+
+    try {
+      await serving.inject({ method: 'GET', url: '/catalog/a?x=1' });
+      await serving.inject({ method: 'GET', url: '/catalog/b' });
+      await new Promise((resolve) => setTimeout(resolve, 150)); // cache writes are fire-and-forget
+      expect(await xCache(serving, '/catalog/a?x=1')).toBe('HIT');
+
+      const res = await operator.inject({ method: 'DELETE', url: `/admin/cache?routeId=${routeId}`, headers: admin });
+
+      expect(res.json()).toMatchObject({ purged: 2 });
+      expect(await xCache(serving, '/catalog/a?x=1')).toBe('MISS'); // the OTHER instance sees it gone
+    } finally {
+      await serving.close();
+      await operator.close();
+    }
+  });
+});
+
 describe.skipIf(!db || !redisAvailable)('admin revoke + Redis auth cache (real Postgres + real Redis)', () => {
   it('revoking through the admin API takes effect INSTANTLY, even though the key is cached', async () => {
     const gw = await gateway({ redis: { url: REDIS_URL } });

@@ -39,6 +39,49 @@ describe.skipIf(!redisAvailable)('createRedisCacheStore (integration)', () => {
     expect(found).toEqual(response);
   });
 
+  describe('deleteByPrefix', () => {
+    const entry: CachedResponse = { statusCode: 200, headers: {}, body: Buffer.from('x') };
+
+    it('removes only the entries under the prefix, and reports how many', async () => {
+      const store = createRedisCacheStore(redis);
+      const ns = `test:purge:${randomUUID()}`;
+      await store.set(`${ns}:a:1`, entry, 60);
+      await store.set(`${ns}:a:2`, entry, 60);
+      await store.set(`${ns}:b:1`, entry, 60);
+
+      expect(await store.deleteByPrefix(`${ns}:a:`)).toBe(2);
+
+      expect(await store.get(`${ns}:a:1`)).toBeNull();
+      expect(await store.get(`${ns}:a:2`)).toBeNull();
+      expect(await store.get(`${ns}:b:1`)).toEqual(entry);
+    });
+
+    it('handles more keys than one SCAN page returns', async () => {
+      const store = createRedisCacheStore(redis);
+      const ns = `test:purge:${randomUUID()}`;
+      await Promise.all(Array.from({ length: 450 }, (_, i) => store.set(`${ns}:k${i}`, entry, 60)));
+
+      expect(await store.deleteByPrefix(`${ns}:`)).toBe(450);
+      expect(await redis.keys(`${ns}:*`)).toHaveLength(0);
+    });
+
+    it('treats glob characters in the prefix literally — a `*` must not widen the purge', async () => {
+      const store = createRedisCacheStore(redis);
+      const ns = `test:purge:${randomUUID()}`;
+      await store.set(`${ns}:we*rd:1`, entry, 60);
+      await store.set(`${ns}:weXrd:1`, entry, 60);
+
+      expect(await store.deleteByPrefix(`${ns}:we*rd:`)).toBe(1);
+
+      expect(await store.get(`${ns}:weXrd:1`)).toEqual(entry); // untouched
+    });
+
+    it('resolves with 0 when nothing matches', async () => {
+      const store = createRedisCacheStore(redis);
+      expect(await store.deleteByPrefix(`test:purge:${randomUUID()}:`)).toBe(0);
+    });
+  });
+
   it('returns null once the ttl expires', async () => {
     const store = createRedisCacheStore(redis);
     const key = `test:cache:${randomUUID()}`;

@@ -20,29 +20,48 @@ export function createCacheStores(config: GatewayConfig, redisClient: Redis | un
   return stores;
 }
 
+const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
+
 /**
- * `cache:<routeId>:<hash>` — hash; method + path + (auth varsa) tenantId +
- * `varyBy`'daki header değerlerini kapsar. tenantId'nin key'e girmesi
- * bilinçli: `varyBy` sadece format header'ları (Accept-Language gibi) için,
- * auth izolasyonu için güvenilecek bir mekanizma değil — aksi halde bir
- * tenant'ın cache'lenmiş yanıtı başka bir tenant'a servis edilebilir.
+ * `cache:<routeId>:<pathHash>:<variantHash>` — anahtar iki katmanlı, ki purge
+ * ön ek ile yapılabilsin: `cache:<routeId>:` route'un tamamını,
+ * `cache:<routeId>:<pathHash>:` ise o path'in tüm varyantlarını (query string,
+ * tenant, varyBy) kapsar. `routeId` URL-encode edilir — aksi halde `a:b` id'li
+ * bir route'un anahtarları `a` route'unun önekine düşer ve purge onları da siler.
+ */
+export function cacheKeyPrefix(routeId: string, path?: string): string {
+  const routePart = `cache:${encodeURIComponent(routeId)}:`;
+  return path === undefined ? routePart : `${routePart}${sha256(path)}:`;
+}
+
+/**
+ * `url` = path + query string (client'ın gördüğü, rewrite öncesi). Query string
+ * anahtarın parçası: `/items?page=1` ile `/items?page=2` ayrı kayıtlardır.
+ * Varyant hash'i method + query + (auth varsa) tenantId + `varyBy`'daki header
+ * değerlerini kapsar. tenantId'nin key'e girmesi bilinçli: `varyBy` sadece
+ * format header'ları (Accept-Language gibi) için, auth izolasyonu için
+ * güvenilecek bir mekanizma değil — aksi halde bir tenant'ın cache'lenmiş
+ * yanıtı başka bir tenant'a servis edilebilir.
  */
 export function buildCacheKey(
   route: RouteConfig,
   method: string,
-  path: string,
+  url: string,
   headers: IncomingHttpHeaders,
   tenantId: string | undefined,
 ): string {
+  const queryStart = url.indexOf('?');
+  const path = queryStart === -1 ? url : url.slice(0, queryStart);
+  const query = queryStart === -1 ? '' : url.slice(queryStart + 1);
+
   const varyBy = route.cache?.varyBy ?? [];
   const varyParts = varyBy.map((name) => {
     const value = headers[name.toLowerCase()];
     return `${name.toLowerCase()}=${Array.isArray(value) ? value.join(',') : (value ?? '')}`;
   });
 
-  const raw = [method, path, tenantId ? `tenant:${tenantId}` : '', ...varyParts].join('|');
-  const hash = createHash('sha256').update(raw).digest('hex');
-  return `cache:${route.id}:${hash}`;
+  const variant = [method, query, tenantId ? `tenant:${tenantId}` : '', ...varyParts].join('|');
+  return `${cacheKeyPrefix(route.id, path)}${sha256(variant)}`;
 }
 
 /**

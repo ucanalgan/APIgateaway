@@ -16,7 +16,7 @@ import { bufferStream } from './proxy/bufferStream.js';
 import { BodyTooLargeError, enforceBodyLimit, enforceHeaderLimit, limitBodySize } from './security/limits.js';
 import { createRateLimitStores, enforceRateLimit } from './ratelimit/index.js';
 import { authenticateRequest } from './auth/index.js';
-import { createCacheStores, buildCacheKey, stripUncacheableHeaders } from './cache/index.js';
+import { createCacheStores, buildCacheKey, cacheKeyPrefix, stripUncacheableHeaders } from './cache/index.js';
 import { createDbPool, runMigrations, type DbPool } from './db/client.js';
 import { createUsageBuffer } from './usage/buffer.js';
 import { createMetrics } from './observability/metrics.js';
@@ -112,13 +112,6 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
   const needsRedis =
     initialConfig.redis &&
     (initialConfig.routes.some((route) => route.rateLimit || route.cache?.enabled) || missingDb.length > 0);
-  // `failOpen`/the auth cache fallback need commands to fail *fast* when
-  // Redis is unreachable. ioredis's default is the opposite — it queues
-  // commands indefinitely while reconnecting, so a down Redis would hang
-  // every request instead of tripping either fallback.
-  const redisClient = needsRedis
-    ? new Redis(initialConfig.redis!.url, { enableOfflineQueue: false, maxRetriesPerRequest: 1, connectTimeout: 2000 })
-    : undefined;
 
   const dbPool: DbPool | undefined =
     initialConfig.db && (missingDb.length > 0 || initialConfig.admin) ? createDbPool(initialConfig.db.url) : undefined;
@@ -140,6 +133,19 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
   const trustProxy: boolean | ((address: string, hop: number) => boolean) =
     trustProxyHops > 0 ? (_address, hop) => hop < trustProxyHops : false;
 
+  // `failOpen`/the auth cache fallback need commands to fail *fast* when
+  // Redis is unreachable. ioredis's default is the opposite — it queues
+  // commands indefinitely while reconnecting, so a down Redis would hang
+  // every request instead of tripping either fallback.
+  //
+  // Created right before the logger and given its 'error' listener with no
+  // `await` in between: ioredis emits 'error' on every failed connection
+  // attempt, and one landing before a listener exists is logged straight to
+  // stderr, bypassing Fastify's structured logger.
+  const redisClient = needsRedis
+    ? new Redis(initialConfig.redis!.url, { enableOfflineQueue: false, maxRetriesPerRequest: 1, connectTimeout: 2000 })
+    : undefined;
+
   const app = Fastify({
     logger: { redact: { paths: REDACT_PATHS, censor: '[redacted]' } },
     trustProxy,
@@ -149,11 +155,11 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
     genReqId: () => randomUUID(),
   });
 
-  // ioredis emits 'error' on every failed reconnect attempt; without a
-  // listener Node logs "Unhandled error event" straight to stderr, bypassing
-  // Fastify's structured logger entirely.
   redisClient?.on('error', (err: unknown) => {
     app.log.warn({ err }, 'redis connection error');
+  });
+  dbPool?.on('error', (err: unknown) => {
+    app.log.warn({ err }, 'postgres pool error');
   });
   if (redisClient) await waitForRedis(redisClient);
 
@@ -232,6 +238,11 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
     await registerAdminRoutes(app, initialConfig.admin.token, {
       db: dbPool,
       ...(redisClient !== undefined ? { redis: redisClient } : {}),
+      // `state` hot-reload'da yeniden atanıyor — her çağrıda güncel store'a bakmalı.
+      purgeCache: (routeId, path) => {
+        const store = state.cacheStores.get(routeId);
+        return store ? store.deleteByPrefix(cacheKeyPrefix(routeId, path)) : undefined;
+      },
     });
   }
 
@@ -335,7 +346,7 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
     const cacheStore = route.cache?.enabled ? state.cacheStores.get(route.id) : undefined;
     const cacheKey =
       cacheStore && request.method === 'GET'
-        ? buildCacheKey(route, request.method, path, request.headers, authOutcome.tenantId)
+        ? buildCacheKey(route, request.method, request.url, request.headers, authOutcome.tenantId)
         : undefined;
 
     if (cacheStore && cacheKey) {

@@ -147,6 +147,13 @@ multi-tenancy — those are call-site concerns (see
 [packages/gateway/src/cache](../gateway/src/cache) for how the actual
 gateway handles both).
 
+A store is `get` / `set` / `deleteByPrefix` / `close`. `deleteByPrefix(prefix)`
+removes every entry whose key starts with `prefix` and resolves with how many
+it removed, so shape your keys hierarchically (`cache:<route>:<path>:<variant>`)
+and purging a route, or one path across all its variants, is a single call.
+The Redis store walks the keyspace with `SCAN` (never `KEYS`, which blocks the
+whole server) and matches glob characters in the prefix literally.
+
 ## Algorithm comparison
 
 The five algorithms all satisfy the same `Algorithm<TState>` signature

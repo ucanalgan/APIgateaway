@@ -12,7 +12,19 @@ import { requireAdminToken } from './auth.js';
 export interface AdminDeps {
   readonly db: DbPool;
   readonly redis?: Redis;
+  /**
+   * Route'un response cache'ini boşaltır (`path` verilirse sadece o path'in
+   * tüm varyantları). Kaç kayıt silindiğini döner; route yoksa ya da cache'i
+   * açık değilse `undefined`. Cache'ler hot-reload'da yenilendiği için
+   * server.ts her çağrıda güncel state'e bakan bir fonksiyon geçer.
+   */
+  readonly purgeCache?: (routeId: string, path?: string) => Promise<number> | undefined;
 }
+
+const purgeCacheQuerySchema = z.object({
+  routeId: z.string().min(1),
+  path: z.string().startsWith('/').optional(),
+});
 
 const createPlanSchema = z.object({
   name: z.string().min(1),
@@ -140,6 +152,21 @@ export async function registerAdminRoutes(app: FastifyInstance, token: string, d
         if (deps.redis) await deps.redis.del(apiKeyCacheKey(revoked.hash));
 
         return reply.code(204).send();
+      });
+
+      // `path`, cache'lenen isteğin client'ın gördüğü (rewrite öncesi) path'idir
+      // — query string'ler, tenant'lar ve varyBy varyantları dahil hepsi silinir.
+      admin.delete('/cache', async (request, reply) => {
+        const parsed = purgeCacheQuerySchema.safeParse(request.query);
+        if (!parsed.success) return sendValidationError(reply, request, parsed.error);
+
+        const { routeId, path } = parsed.data;
+        const purged = await deps.purgeCache?.(routeId, path);
+        if (purged === undefined) {
+          return reply.code(404).send(notFound(request, 'cache-enabled route'));
+        }
+
+        return { routeId, ...(path !== undefined ? { path } : {}), purged };
       });
 
       admin.get<{ Querystring: { tenantId?: string; sinceHours?: string } }>('/usage', async (request) => {

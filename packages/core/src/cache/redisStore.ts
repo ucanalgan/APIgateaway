@@ -32,8 +32,27 @@ export function createRedisCacheStore(redis: Redis): CacheStore {
       await redis.set(key, JSON.stringify(serialized), 'EX', ttlSec);
     },
 
+    async deleteByPrefix(prefix: string): Promise<number> {
+      // SCAN, never KEYS: KEYS blocks the whole Redis server while it walks the
+      // keyspace, which on a shared instance is an outage of its own.
+      let removed = 0;
+
+      for await (const keys of redis.scanStream({ match: `${escapeGlob(prefix)}*`, count: 200 }) as AsyncIterable<string[]>) {
+        if (keys.length === 0) continue;
+        // SCAN may return the same key twice; DEL only counts keys it really removed.
+        removed += await redis.del(...keys);
+      }
+
+      return removed;
+    },
+
     async close(): Promise<void> {
       await redis.quit();
     },
   };
+}
+
+/** Redis MATCH patterns are globs — a key prefix containing `*?[]\` must match literally. */
+function escapeGlob(literal: string): string {
+  return literal.replace(/[\\*?[\]]/g, '\\$&');
 }

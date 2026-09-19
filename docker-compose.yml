@@ -3,6 +3,11 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
 
   postgres:
     image: postgres:16-alpine
@@ -14,6 +19,11 @@ services:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U apigate -d apigate"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
 
   # Two instances so the resilience demo has something to fail over between —
   # see gateway.docker.yaml's `echo-upstream` route (healthCheck + retry +
@@ -38,11 +48,18 @@ services:
       GATEWAY_CONFIG: /app/gateway.docker.yaml
     ports:
       - "8080:8080"
+    # The gateway runs migrations against Postgres on boot and exits if it
+    # can't connect, so it must wait for the databases to be *ready* — a bare
+    # `depends_on` list only waits for the containers to have started.
     depends_on:
-      - redis
-      - postgres
-      - upstream
-      - upstream2
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      upstream:
+        condition: service_started
+      upstream2:
+        condition: service_started
 
 volumes:
   postgres-data:

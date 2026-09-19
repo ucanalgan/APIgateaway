@@ -5,7 +5,15 @@ import pg from 'pg';
 export type DbPool = pg.Pool;
 
 export function createDbPool(connectionString: string): DbPool {
-  return new pg.Pool({ connectionString });
+  const pool = new pg.Pool({ connectionString });
+
+  // Postgres bir idle bağlantıyı düşürdüğünde (restart, failover, admin
+  // terminate) pool 'error' yayar; dinleyici yoksa bu yakalanmamış istisnaya
+  // dönüp süreci çökertir. Pool zaten bir sonraki sorguda yeni bağlantı açar —
+  // burada yapılacak tek şey çökmemek. Asıl loglama server.ts'te eklenir.
+  pool.on('error', () => {});
+
+  return pool;
 }
 
 /**

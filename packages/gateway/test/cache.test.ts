@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildCacheKey, stripUncacheableHeaders } from '../src/cache/index.js';
+import { buildCacheKey, cacheKeyPrefix, stripUncacheableHeaders } from '../src/cache/index.js';
 import { gatewayConfigSchema, type RouteConfig } from '../src/config/schema.js';
 
 function routeWithCache(varyBy: string[] = []): RouteConfig {
@@ -42,6 +42,40 @@ describe('buildCacheKey', () => {
     const a = buildCacheKey(route, 'GET', '/x', { 'accept-language': 'en', 'x-irrelevant': 'a' }, undefined);
     const b = buildCacheKey(route, 'GET', '/x', { 'accept-language': 'en', 'x-irrelevant': 'b' }, undefined);
     expect(a).toBe(b);
+  });
+
+  it('differs by query string', () => {
+    const route = routeWithCache();
+    expect(buildCacheKey(route, 'GET', '/items?page=1', {}, undefined)).not.toBe(
+      buildCacheKey(route, 'GET', '/items?page=2', {}, undefined),
+    );
+    expect(buildCacheKey(route, 'GET', '/items?page=1', {}, undefined)).not.toBe(
+      buildCacheKey(route, 'GET', '/items', {}, undefined),
+    );
+  });
+
+  it('groups every variant of one path under the same purge prefix — and nothing else', () => {
+    const route = routeWithCache(['Accept-Language']);
+    const variants = [
+      buildCacheKey(route, 'GET', '/items', {}, undefined),
+      buildCacheKey(route, 'GET', '/items?page=2', {}, undefined),
+      buildCacheKey(route, 'GET', '/items', { 'accept-language': 'tr' }, undefined),
+      buildCacheKey(route, 'GET', '/items', {}, 'tenant-a'),
+    ];
+    const prefix = cacheKeyPrefix(route.id, '/items');
+
+    for (const key of variants) expect(key.startsWith(prefix)).toBe(true);
+    expect(buildCacheKey(route, 'GET', '/items/other', {}, undefined).startsWith(prefix)).toBe(false);
+    expect(buildCacheKey(route, 'GET', '/items', {}, undefined).startsWith(cacheKeyPrefix(route.id))).toBe(true);
+  });
+
+  it('never lets one route\'s purge prefix match another route\'s keys, even when ids contain ":"', () => {
+    const outer = routeWithCache();
+    const inner = { ...outer, id: `${outer.id}:nested` };
+
+    const innerKey = buildCacheKey(inner, 'GET', '/x', {}, undefined);
+
+    expect(innerKey.startsWith(cacheKeyPrefix(outer.id))).toBe(false);
   });
 
   it('scopes the key by tenant — the cross-tenant-leak guard', () => {

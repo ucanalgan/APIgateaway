@@ -1,6 +1,19 @@
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
+const coreSrc = fileURLToPath(new URL('./packages/core/src', import.meta.url));
+
 export default defineConfig({
+  resolve: {
+    // Tests run against `@apigate/core`'s source, not its built `dist/` — so
+    // `npm test` works on a fresh clone with no prior `npm run build` (dist has
+    // no `.lua` files until `copy-lua.mjs` runs), and core's coverage counts
+    // the code gateway tests exercise too.
+    alias: [
+      { find: /^@apigate\/core$/, replacement: `${coreSrc}/index.ts` },
+      { find: /^@apigate\/core\/(ratelimit|auth|breaker|cache)$/, replacement: `${coreSrc}/$1/index.ts` },
+    ],
+  },
   test: {
     coverage: {
       provider: 'v8',

@@ -27,6 +27,19 @@ export function createMemoryCacheStore(): CacheStore {
       return Promise.resolve();
     },
 
+    deleteByPrefix(prefix: string): Promise<number> {
+      const now = Date.now();
+      let removed = 0;
+
+      for (const [key, entry] of entries) {
+        if (!key.startsWith(prefix)) continue;
+        entries.delete(key);
+        if (now < entry.expiresAt) removed++; // an already-expired entry was effectively gone
+      }
+
+      return Promise.resolve(removed);
+    },
+
     close(): Promise<void> {
       entries.clear();
       return Promise.resolve();
