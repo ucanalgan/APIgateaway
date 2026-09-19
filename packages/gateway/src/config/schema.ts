@@ -104,11 +104,24 @@ const circuitBreakerSchema = z.object({
   resetTimeoutMs: z.number().int().positive().default(30000),
 });
 
+// Hostname ya da `*.` ile başlayan tek seviyeli joker; port/şema içermez
+// (istekteki port zaten eşleşmeden önce atılır).
+const HOST_PATTERN = /^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/i;
+
 const routeSchema = z.object({
   id: z.string().min(1),
   match: z.object({
     path: z.string().min(1),
     methods: z.array(httpMethodSchema).optional(),
+    /**
+     * Sadece bu hostname'e eşleşir (büyük/küçük harf ve port fark etmez);
+     * `*.example.com` her alt alan adını kapsar ama `example.com`'un kendisini
+     * değil. Verilmezse route her host'a cevap verir.
+     */
+    host: z
+      .string()
+      .regex(HOST_PATTERN, 'must be a hostname like "api.example.com" or "*.example.com" — no port, no scheme')
+      .optional(),
   }),
   rewrite: z
     .object({

@@ -20,6 +20,11 @@ export default defineConfig({
       reporter: ['text', 'json-summary', 'html'],
       include: ['packages/*/src/**/*.ts', 'packages/adapters/*/src/**/*.ts'],
       exclude: ['**/*.d.ts', '**/scripts/**'],
+      // A floor, not a target (the suite sits around 95%): a run that drops
+      // below it fails. That also makes CI fail loudly if the Redis/Postgres
+      // tests ever silently skip — without those services coverage falls to
+      // roughly two-thirds.
+      thresholds: { statements: 90, branches: 85, functions: 90, lines: 90 },
     },
   },
 });

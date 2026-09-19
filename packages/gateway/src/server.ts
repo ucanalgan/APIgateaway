@@ -5,7 +5,7 @@ import { Redis } from 'ioredis';
 import { decideCacheability } from '@apigate/core/cache';
 import type { GatewayConfig } from './config/schema.js';
 import { watchConfig } from './config/watch.js';
-import { matchRoute, matchRouteByPath } from './routing/matcher.js';
+import { matchRoute, matchRouteByPath, normalizeHost } from './routing/matcher.js';
 import { rewritePath } from './routing/rewrite.js';
 import { isOriginAllowed, applyCorsResponseHeaders, applyPreflightHeaders } from './cors/index.js';
 import { UpstreamTimeoutError } from './proxy/forward.js';
@@ -277,6 +277,10 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
 
   app.all('/*', async (request, reply) => {
     const path = request.url.split('?')[0] ?? '/';
+    // `request.hostname` X-Forwarded-Host'a sadece trustProxy'nin güvendiği bir
+    // hop'tan geldiyse bakar — istemci kendi başına host'unu sahteleyip başka
+    // bir route'a düşemez.
+    const host = normalizeHost(request.hostname);
 
     // CORS preflight: tarayıcı bunu her zaman `OPTIONS` + kendi ürettiği
     // `Access-Control-Request-Method` header'ıyla gönderir — bir istemci
@@ -292,7 +296,7 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
       typeof request.headers['access-control-request-method'] === 'string';
 
     if (isPreflight) {
-      const corsRoute = matchRouteByPath(state.config.routes, path);
+      const corsRoute = matchRouteByPath(state.config.routes, path, host);
       if (corsRoute?.cors?.enabled && isOriginAllowed(corsRoute.cors, origin)) {
         request.apigateRouteId = corsRoute.id;
         applyPreflightHeaders(corsRoute.cors, origin, reply);
@@ -300,7 +304,7 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
       }
     }
 
-    const route = matchRoute(state.config.routes, { method: request.method, path });
+    const route = matchRoute(state.config.routes, { method: request.method, path, host });
 
     if (!route) {
       return reply.code(404).send({
@@ -346,7 +350,7 @@ export async function buildServer(initialConfig: GatewayConfig, configPath: stri
     const cacheStore = route.cache?.enabled ? state.cacheStores.get(route.id) : undefined;
     const cacheKey =
       cacheStore && request.method === 'GET'
-        ? buildCacheKey(route, request.method, request.url, request.headers, authOutcome.tenantId)
+        ? buildCacheKey(route, request.method, request.url, request.headers, authOutcome.tenantId, host)
         : undefined;
 
     if (cacheStore && cacheKey) {

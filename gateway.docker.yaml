@@ -36,6 +36,19 @@ routes:
         - http://upstream:4000
       timeoutMs: 5000
 
+  # Host-based routing (see README § Host-based routing): this route only
+  # answers `*.sites.test`, whatever the path — the Host header picks the
+  # route, so no DNS is needed to try it:
+  #   curl -H 'Host: acme.sites.test' http://localhost:8080/hello
+  - id: tenant-sites
+    match:
+      host: '*.sites.test'
+      path: /*
+    upstream:
+      targets:
+        - http://upstream:4000
+      timeoutMs: 5000
+
   # Two targets + health check + breaker + retry — stop one
   # (`docker compose stop upstream2`) and traffic keeps flowing through the
   # other with no failed requests. See README § Resilience.

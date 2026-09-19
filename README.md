@@ -202,6 +202,49 @@ cut off the moment it crosses the limit — the upstream never receives a
 complete request. An oversized body is the client's fault, so it never counts
 against an upstream's circuit breaker.
 
+### Host-based routing
+
+`match.host` makes a route answer only one hostname, so a single gateway can
+front several domains — or one tenant per subdomain:
+
+```yaml
+routes:
+  - id: acme-site
+    match: { host: acme.example.com, path: /* }
+    upstream: { targets: [http://acme-web:3000] }
+
+  - id: tenant-sites
+    match: { host: '*.sites.example.com', path: /* }   # quote it — a bare * is a YAML alias
+    upstream: { targets: [http://tenant-web:3000] }
+
+  - id: fallback                                        # no host = any host
+    match: { path: /* }
+    upstream: { targets: [http://default-web:3000] }
+```
+
+The host is compared without its port and case-insensitively. `*.` matches
+subdomains at any depth but not the bare domain (`*.sites.example.com` covers
+`a.sites.example.com` and `a.b.sites.example.com`, not `sites.example.com`).
+Routes are still tried in order, so put host-specific routes before a
+host-less catch-all. Try it without any DNS: `curl -H 'Host: acme.sites.test'
+http://localhost:8080/hello` against the Docker Compose stack.
+
+Two details that are about security rather than convenience:
+
+- **`X-Forwarded-Host` is only believed when `server.trustProxyHops` trusts the
+  connection it arrived on** — the same rule as `X-Forwarded-For`. With the
+  default of `0` the real `Host` header decides, so a client can't send
+  `X-Forwarded-Host: admin.example.com` to land on another host's route.
+- **On a host-matched route the host is part of the response-cache key.**
+  Without that, a `*.sites.example.com` route would serve
+  `acme.sites.example.com`'s cached page to `globex.sites.example.com` — the
+  same cross-tenant leak that keying the cache by tenant prevents on
+  authenticated routes. (Host-less routes serve the same content for every
+  host, so they aren't split by it.)
+
+Rate-limit counters, the circuit breaker and metrics stay per *route*, and a
+CORS preflight is answered by the route that owns the request's host.
+
 ### Rate limiting
 
 A route with `rateLimit` gets one of five algorithms (`fixedWindow`,
@@ -524,9 +567,15 @@ npm run coverage   # vitest run --coverage (needs Redis/Postgres reachable, same
 ```
 
 The badge is `v8`-measured statement coverage from the full suite run
-against real Redis and Postgres: **96% statements, 92% branches, 95%
-functions** (235 tests). It's a hand-updated number — re-run the command
-above and edit the badge at the top of this file when it moves.
+against real Redis and Postgres: **96% statements, 93% branches, 95%
+functions** (270 tests). The badge is hand-updated — re-run the command
+above and edit it when the number moves.
+
+CI runs `npm run coverage` and enforces a floor (90% statements/lines/
+functions, 85% branches, set in [`vitest.config.ts`](vitest.config.ts)), so
+coverage can't quietly rot. It doubles as a guard against the Redis/Postgres
+tests silently skipping: without those services the suite drops to about
+73% and the run fails, instead of going green on a fraction of the tests.
 
 Two layers of tests produce it. `packages/core` — the framework-agnostic
 algorithms, auth, breaker, and cache logic — is unit-tested directly, since

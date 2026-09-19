@@ -49,6 +49,7 @@ export function buildCacheKey(
   url: string,
   headers: IncomingHttpHeaders,
   tenantId: string | undefined,
+  host?: string,
 ): string {
   const queryStart = url.indexOf('?');
   const path = queryStart === -1 ? url : url.slice(0, queryStart);
@@ -60,7 +61,14 @@ export function buildCacheKey(
     return `${name.toLowerCase()}=${Array.isArray(value) ? value.join(',') : (value ?? '')}`;
   });
 
-  const variant = [method, query, tenantId ? `tenant:${tenantId}` : '', ...varyParts].join('|');
+  // Host'a göre eşleşen bir route (özellikle `*.example.com`) birden çok host'a
+  // cevap verir ve upstream içeriği host'a göre değiştirebilir (alt alan adı
+  // başına tenant) — host anahtara girmezse `acme.x.com/panel` cevabı
+  // `globex.x.com/panel`'e servis edilirdi. Host'suz route'lar için girmez:
+  // aynı içeriği her host altında sunuyorlar, girmesi cache'i boşuna böler.
+  const hostPart = route.match.host ? `host:${host ?? ''}` : '';
+
+  const variant = [method, query, tenantId ? `tenant:${tenantId}` : '', hostPart, ...varyParts].join('|');
   return `${cacheKeyPrefix(route.id, path)}${sha256(variant)}`;
 }
 

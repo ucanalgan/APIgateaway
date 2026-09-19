@@ -44,7 +44,10 @@ jobs:
       # and gateway assets, so this is what catches a broken build (the
       # Dockerfile broke once precisely because CI never ran it).
       - run: npm run build
-      - run: npm run test
+      # Runs the whole suite (same as `npm run test`) plus enforces the coverage
+      # floor in vitest.config.ts — including catching the Redis/Postgres tests
+      # silently skipping because a service didn't come up.
+      - run: npm run coverage
         env:
           REDIS_URL: redis://localhost:6379
           POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
