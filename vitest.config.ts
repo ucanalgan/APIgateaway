@@ -15,6 +15,12 @@ export default defineConfig({
     ],
   },
   test: {
+    // Real timers, real sockets, real ping/idle/backpressure intervals — under
+    // CI's full-suite parallelism (dozens of files, each a real HTTP/WS server)
+    // the default 5s/10s budgets get tight from scheduling contention alone,
+    // not from anything actually being slow. Generous, not tuned per-test.
+    testTimeout: 20_000,
+    hookTimeout: 20_000,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary', 'html'],
